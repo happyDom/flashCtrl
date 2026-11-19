@@ -42,6 +42,7 @@ example/
 ```c
 #define FLASH_CTRL_ACTUATOR_NUM     2          /* 需要控制的执行器数量，1~255 */
 #define FLASH_CTRL_CYCLE_MS         10         /* 调度周期（一拍多少毫秒），必须与实际调用 ticks 的周期一致 */
+#define FLASH_CTRL_LANG_EN          1          /* 是否需要灯语模式：1 需要，0 裁掉灯语省 RAM/代码（缺省为 1） */
 /* #define FLASH_CTRL_MEM_ATTR      xdata */  /* 可选，C51 上指定内存池存放区 */
 ```
 
@@ -75,13 +76,71 @@ example/
 | `flashCtrl_getCapacity()` | 查询内存池容量（即 `FLASH_CTRL_ACTUATOR_NUM`） |
 | `flashCtrl_setThdCnt(handle, on_thd, off_thd)` | 按节拍数设置动作态 / 静止态时长，同时清零节拍计数 |
 | `flashCtrl_setThdMs(handle, on_ms, off_ms)` | 按毫秒数设置动作态 / 静止态时长，库内用 `FLASH_CTRL_CYCLE_MS` 换算成节拍数（向上取整，0 毫秒仍为 0 拍） |
-| `flashCtrl_getThdCnt(handle, &on_thd, &off_thd)` | 读取当前节拍数（参数可传 `NULL`） |
-| `flashCtrl_reset(handle)` | 清零节拍计数，不改变阈值与执行器状态 |
+| `flashCtrl_getThdCnt(handle, &on_thd, &off_thd)` | 读取当前节拍数（参数可传 `NULL`）；阈值不随模式切换丢失，灯语模式下也能读回切走前的值 |
+| `flashCtrl_reset(handle)` | 清零当前阶段进度：简单模式清节拍计数，灯语模式清阶段计时；不改变阈值、模式与执行器状态 |
 | `flashCtrl_start(handle)` | 把句柄加入工作链表，重复加入返回 -1 |
 | `flashCtrl_stop(handle, offState)` | 把句柄移出工作链表，并按 `offState` 指定停止时的执行器末态：`KEEP` 不动硬件、`ACTIVE` 停在动作态、`IDLE` 停在静止态（后两者会切换状态并清零节拍计数） |
 | `flashCtrl_ticks()` | 节拍调度，按固定周期调用即可推进所有已启动的句柄 |
 
 > 单个句柄的节拍处理（即通用化后的 `led0_toggle()`）是库内私有函数，由 `flashCtrl_ticks` 内部调用，不对外暴露。
+
+### 灯语模式（`FLASH_CTRL_LANG_EN = 1` 时可用）
+
+一个句柄同一时刻只处于一种模式：
+- 切到灯语模式：`flashCtrl_langTrigger(handle, ...)`；
+- 退出灯语模式：`flashCtrl_exitLangMode(handle)`（阈值沿用切走前的值，无需重设），
+  或者直接调 `flashCtrl_setThdCnt` / `flashCtrl_setThdMs`（等于“切回简单模式并重设时长”）。
+
+两种模式的进度共用同一块句柄内存（联合体），而简单模式的阈值放在联合体外面，
+所以来回切换时阈值不会丢，句柄也不会因为多了一种模式而明显变大。
+
+灯的时序由**全局**配置一次，所有句柄共用；触发时只给次数。
+各段“熄灭”时长是共用的，因此配置只需四个时长：
+
+| 参数 | 含义 |
+| --- | --- |
+| `longOn` | 长亮的点亮时长 |
+| `shortOn` | 短亮的点亮时长 |
+| `gapOff` | 每次闪烁之间的熄灭时长（长亮之间、短亮之间、长亮组与短亮组之间共用） |
+| `leadOff` | 首尾熄灭时长（触发时的起始熄灭、一轮结束的收尾熄灭共用） |
+
+| 方法 | 说明 |
+| --- | --- |
+| `flashCtrl_setLangCfgCnt(longOn, shortOn, gapOff, leadOff)` | 按节拍数配置灯语各段时长 |
+| `flashCtrl_setLangCfgMs(longOnMs, shortOnMs, gapOffMs, leadOffMs)` | 同上，但按毫秒数给，库内用 `FLASH_CTRL_CYCLE_MS` 换算成节拍数 |
+| `flashCtrl_langTrigger(handle, timesOfLong, timesOfShort)` | 触发灯语：指定长亮 / 短亮次数，轮数与进度清零后从头跑；两者都传 0 表示取消（回空闲、不动执行器） |
+| `flashCtrl_exitLangMode(handle)` | 退出灯语、回到简单模式，恢复按 `on_thd` / `off_thd` 周期闪烁（阈值沿用切走前的值） |
+| `flashCtrl_getLangCycle(handle)` | 查询已完成的整轮数（65535 封顶） |
+| `flashCtrl_resetLangCycle(handle)` | 只清零轮数，不影响正在跑的进度 |
+
+一轮的时序：
+
+```
+起始熄灭(可选，leadOff) → [长亮 on]*N → 熄灭(gapOff) → … → 组间熄灭(gapOff) → [短亮 on]*M → … → 收尾熄灭(leadOff) → 下一轮
+```
+
+- 一轮跑完**自动进入下一轮**，因此“同一个错误码报 N 轮再换下一个”只需查 `flashCtrl_getLangCycle`；
+- **起始熄灭是按需的**：触发时执行器正亮着才先灭 `leadOff` 拍（与简单模式 toggle 的口径一致）；
+  触发时本就熄灭，则直接进入长亮组，不再额外延长一个熄灭周期；
+- 任一段时长配置为 0 拍即跳过该阶段；`timesOfLong = 0` 时不报长亮组（组间熄灭也一并跳过）；
+- 长亮次数用完后才进入短亮组，两组之间同样用 `gapOff` 分隔；
+- 一轮结束时用 `leadOff` 收尾，这个收尾熄灭同时也是两轮之间的间隔；
+- 各段的“灭”共用 `gapOff`（`leadOff` 只管首尾），所以灯语的节奏是均匀的：亮时长决定长短，灭时长统一；
+- 停止/取消：取消用 `flashCtrl_langTrigger(handle, 0, 0)`（回空闲、不动硬件）；
+  连调度一起停并指定末态，用 `flashCtrl_stop(handle, offState)`，口径与简单模式完全相同。
+
+示例（2 次长亮 + 2 次短亮；长亮亮 300ms、短亮亮 100ms、闪烁间熄灭 200ms、首尾各熄 700ms）：
+
+```c
+flashCtrl_setLangCfgMs(300, 100, 200, 700);                 /* 全局配置一次 */
+flashCtrl_langTrigger(led0, 2, 2);                          /* 触发：只给次数 */
+if (flashCtrl_getLangCycle(led0) >= 2) {                    /* 报够 2 轮 */
+    flashCtrl_langTrigger(led0, 0, 0);                      /* 取消当前灯语 */
+    flashCtrl_langTrigger(led0, 3, 1);                      /* 换下一个错误码 */
+}
+
+flashCtrl_exitLangMode(led0);                              /* 不再用灯语：切回周期闪烁，原阈值仍在 */
+```
 
 ### 节拍语义
 
@@ -124,4 +183,10 @@ flashCtrl_deinit(led0, FLASH_CTRL_STS_KEEP);
 
 ## 参与贡献
 
-tbd
+1、Fork 本仓库
+
+2、新建 Feat_xxx 分支
+
+3、提交代码
+
+4、新建 Pull Request

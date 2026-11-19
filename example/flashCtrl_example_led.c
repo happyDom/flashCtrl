@@ -44,12 +44,27 @@ void main(void){
     flashCtrl_setThdMs(buzzer, 20, 280);   // 鸣 20ms、停 280ms（10ms 一拍 → 2 拍 / 28 拍）
     flashCtrl_start(buzzer);
 
+    // 配置灯语参数，长亮时间 / 短亮时间 / 闪烁间熄灭时间 / 首尾(两次灯语间间隔）熄灭时间
+    flashCtrl_setLangCfgMs(300, 100, 200, 700);
+
     while(1){
         delay_ms(10);        /* 固定节拍周期，须与 FLASH_CTRL_CYCLE_MS 一致 */
         flashCtrl_ticks();   /* 所有已启动的执行器在此推进节拍 */
 
         // 运行中修改闪烁时长（按毫秒指定，内部按 FLASH_CTRL_CYCLE_MS 换算成节拍数）
         // flashCtrl_setThdMs(led0, on_ms, off_ms);
+
+        // 需要“长亮 N 次 + 短亮 M 次”这类灯语报错时，同一个句柄直接切成灯语模式即可（模式互斥）
+        // flashCtrl_langTrigger(led0, 3, 2);           // 触发：只给次数（3 次长亮 + 2 次短亮），跑完自动重复
+
+        // 灯语跑满 3 轮后切换到下一个错误码（跑完自动重复，所以何时切换由用户决定）
+        // if (flashCtrl_getLangCycle(led0) >= 3) { 
+        //     flashCtrl_resetLangCycle(led0); 
+        //     flashCtrl_langTrigger(led0, 3, 1); 
+        // }
+
+        // 不再用灯语时切回周期闪烁（阈值沿用切走前的值，不用重设）
+        // flashCtrl_exitLangMode(led0);
 
         // 可以随时停止闪烁，停在熄灭状态，句柄仍保留（可再次 start 继续闪）
         // flashCtrl_stop(buzzer, FLASH_CTRL_STS_IDLE);

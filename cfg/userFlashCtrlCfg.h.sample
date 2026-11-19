@@ -26,8 +26,13 @@
 
 /* 调度周期（一拍 = 多少毫秒），取值 1~255
  * 必须与调用 flashCtrl_ticks() 的实际周期一致，例如主循环延时 10ms 调一次，就填 10。
- * 用 flashCtrl_setThd() 直接给节拍数时不依赖该值；用 flashCtrl_setThdMs() 给毫秒数时按该值换算。 */
+ * 用 flashCtrl_setThdCnt() 直接给节拍数时不依赖该值；用 flashCtrl_setThdMs() 给毫秒数时按该值换算。 */
 #define FLASH_CTRL_CYCLE_MS         10
+
+/* 灯语模式开关
+ * 需要“长亮 N 次 + 短亮 M 次”这类灯语报错的置 1；只用周期闪烁的置 0，
+ * 可省掉灯语状态占用的 RAM 与相关代码（置 0 后 flashCtrl_setLangCfg* 等接口不存在）。 */
+#define FLASH_CTRL_LANG_EN          1
 
 /* 可选：静态内存池的存放区
  * 在 51 类单片机上，可按项目情况指定 data/idata/xdata/pdata，
