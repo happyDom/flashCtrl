@@ -1,0 +1,38 @@
+/*
+ * userFlashCtrlCfg.h.sample —— flashCtrl 库的用户配置文件参考样例
+ *
+ * 说明：本文件带 .sample 后缀，不会被任何头文件搜索路径当作配置文件使用，
+ *       它的作用只是给你一个可以照抄的样例，请不要在本库目录内修改它。
+ *
+ * 使用说明：
+ * 1、在你的项目里新建 userFlashCtrlCfg.h（文件名去掉 .sample），把下面的宏抄进去并按项目情况修改，
+ *    不需要改动 flashCtrl 模块本身的任何代码。
+ * 2、flashCtrl.h 会引用你项目里的 userFlashCtrlCfg.h，如果编译时提示
+ *    “please #define FLASH_CTRL_ACTUATOR_NUM //in userFlashCtrlCfg.h”，
+ *    说明这个文件没有被找到，或 FLASH_CTRL_ACTUATOR_NUM 已被注释掉。
+ * 3、库内没有自带定时器，节拍由你按固定周期调用 flashCtrl_ticks() 产生，
+ *    所以 FLASH_CTRL_CYCLE_MS 必须与你的实际调用周期一致，
+ *    flashCtrl_setThdMs() 就是按这个值把毫秒换算成节拍数的。
+ */
+#ifndef _USER_FLASH_CTRL_CFG_H_
+#define _USER_FLASH_CTRL_CFG_H_
+
+/* 需要控制的执行器数量（LED、蜂鸣器……各算一个，取值范围 1~255）
+ * 库内静态内存池的大小 = FLASH_CTRL_ACTUATOR_NUM * sizeof(FlashCtrl)，
+ * 所以该值直接决定了本库占用的 RAM。
+ * 建议：开发初期先给一个够用的值，项目定形后，用 flashCtrl_getUsedCount()
+ *       读出实际使用数量，再调整到这里。 */
+#define FLASH_CTRL_ACTUATOR_NUM     2
+
+/* 调度周期（一拍 = 多少毫秒），取值 1~255
+ * 必须与调用 flashCtrl_ticks() 的实际周期一致，例如主循环延时 10ms 调一次，就填 10。
+ * 用 flashCtrl_setThd() 直接给节拍数时不依赖该值；用 flashCtrl_setThdMs() 给毫秒数时按该值换算。 */
+#define FLASH_CTRL_CYCLE_MS         10
+
+/* 可选：静态内存池的存放区
+ * 在 51 类单片机上，可按项目情况指定 data/idata/xdata/pdata，
+ * 例如： #define FLASH_CTRL_MEM_ATTR      xdata
+ * 不定义时表示不限定存储区（由编译器默认处理）。 */
+/* #define FLASH_CTRL_MEM_ATTR      xdata */
+
+#endif /* _USER_FLASH_CTRL_CFG_H_ */
