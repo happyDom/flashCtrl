@@ -22,7 +22,8 @@
  * 两种模式：
  *   1) 简单模式：灭 off_thd 拍后动作、动作 on_thd 拍后停止，无限循环；
  *   2) 灯语模式：起始熄灭(可选) → [长亮]*N → 组间熄灭 → [短亮]*M → 收尾熄灭，
- *      一轮跑完自动进入下一轮，轮数可查询/清零（用于“同一错误码报 N 轮再换下一个”）。
+ *      轮数在触发时一次给定，跑满设定轮数后自停（停在熄灭态），调用方查 flashCtrl_isLangDone
+ *      后再切换下一个错误码；cycles 传 0 表示无限重复（常驻故障指示）。
  *
  * 模式切换：flashCtrl_langTrigger 切到灯语模式，flashCtrl_exitLangMode（或 setThdCnt/setThdMs）
  * 切回简单模式；简单模式的阈值存放在联合体外面，所以来回切换时阈值不会丢。
@@ -103,6 +104,7 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_sts_fu
             handle->u.lang.cycleCnt   = 0;
             handle->u.lang.longTotal  = 0;
             handle->u.lang.shortTotal = 0;
+            handle->u.lang.cycles     = 0;
             handle->u.lang.longDone   = 0;
             handle->u.lang.shortDone  = 0;
             handle->u.lang.phase      = LANG_PH_IDLE;
@@ -143,6 +145,7 @@ void flashCtrl_deinit(FlashCtrl* handle, flashCtrlOffState_t offState) {
     handle->u.lang.cycleCnt   = 0;
     handle->u.lang.longTotal  = 0;
     handle->u.lang.shortTotal = 0;
+    handle->u.lang.cycles     = 0;
     handle->u.lang.longDone   = 0;
     handle->u.lang.shortDone  = 0;
     handle->u.lang.phase      = LANG_PH_IDLE;
@@ -419,12 +422,19 @@ static void langAdvance(FlashCtrl* handle) {
         break;
 
     case LANG_PH_GAP_OFF:
-        // 一轮结束：计轮数，清零本轮进度，直接开始下一轮
-        // （此时执行器仍是熄灭状态，因此不再插入“起始熄灭”）
+        // 一轮结束：计轮数
         FLASH_CNT_INC(handle->u.lang.cycleCnt);
         handle->u.lang.longDone  = 0;
         handle->u.lang.shortDone = 0;
-        langEnter(handle, langFirstOnPhase(handle));
+
+        if(0 != handle->u.lang.cycles && handle->u.lang.cycleCnt >= handle->u.lang.cycles){
+            // 已跑满设定轮数：停在熄灭态，不再推进（由调用方查 isLangDone 后切换下一个错误码）
+            langEnter(handle, LANG_PH_IDLE);
+        } else {
+            // 还没跑满（或 cycles 为 0 表示无限重复）：执行器此时仍是熄灭态，直接开始下一轮，
+            // 因此不再插入“起始熄灭”
+            langEnter(handle, langFirstOnPhase(handle));
+        }
         break;
 
     default:
@@ -488,19 +498,21 @@ void flashCtrl_setLangCfgMs(uint16_t longOnMs, uint16_t shortOnMs, uint16_t gapO
 }
 
 /**
-  * @brief  触发一次灯语：设置本轮的长亮/短亮次数，轮数与进度清零后从头开始跑。
+  * @brief  触发一次灯语：设置本轮的长亮/短亮次数与需要重复的整轮数，轮数与进度清零后从头开始跑。
   * @param  handle:       闪烁控制句柄
   * @param  timesOfLong:  长亮次数（0：不报长亮组）
   * @param  timesOfShort: 短亮次数（0：不报短亮组；两者都为 0 表示取消灯语）
+  * @param  cycles:       需要跑几整轮，跑满后自动停在熄灭态；0 表示无限重复
   * @retval None
   */
-void flashCtrl_langTrigger(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOfShort) {
+void flashCtrl_langTrigger(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOfShort, uint8_t cycles) {
     if(NULL == handle || 0 == handle->inUse) return;
 
     handle->mode = FLASH_CTRL_MODE_LANG;
 
     handle->u.lang.longTotal  = timesOfLong;
     handle->u.lang.shortTotal = timesOfShort;
+    handle->u.lang.cycles     = cycles;
     handle->u.lang.longDone   = 0;
     handle->u.lang.shortDone  = 0;
     handle->u.lang.cycleCnt   = 0;
@@ -535,12 +547,26 @@ void flashCtrl_exitLangMode(FlashCtrl* handle) {
     handle->u.lang.cycleCnt = 0;
     handle->u.lang.longTotal  = 0;
     handle->u.lang.shortTotal = 0;
+    handle->u.lang.cycles     = 0;
     handle->u.lang.longDone   = 0;
     handle->u.lang.shortDone  = 0;
     handle->u.lang.lit        = 1;
 
     handle->u.simple.on_cnt  = 0;
     handle->u.simple.off_cnt = 0;
+}
+
+/**
+  * @brief  灯语是否已跑完设定轮数。
+  * @param  handle: 闪烁控制句柄
+  * @retval 1：已跑完（执行器停在熄灭态、不再推进）；
+  *         0：还在跑，或 cycles 传了 0（无限重复），或当前不在灯语模式
+  */
+uint8_t flashCtrl_isLangDone(FlashCtrl* handle) {
+    if(NULL == handle || FLASH_CTRL_MODE_LANG != handle->mode) return 0;
+    if(0 == handle->u.lang.cycles) return 0;   // 无限重复，不存在“跑完”
+
+    return (handle->u.lang.cycleCnt >= handle->u.lang.cycles) ? 1 : 0;
 }
 
 /**

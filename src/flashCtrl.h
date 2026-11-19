@@ -29,6 +29,26 @@
  *       避免后续向本库提交更新时夹带项目数据。
  * 本库只依赖 stdint.h，不使用 string.h 等库函数。
  */
+
+/* 使用注意（都是实际集成到项目时踩过的坑，照着做能省不少调试时间）
+ * 1、 get_sts 必须真读端口状态（如 P42 ? 1 : 0），不要返回软件标志位。
+ *     简单模式每一拍都靠它判断执行器当前状态，标志位一旦与硬件不一致（别的逻辑改了灯、
+ *     上电初值不同、被外部强行拉低……）就会“跑飞”：该灭的时候不灭、该亮的时候不亮。
+ *     灯语模式内部用句柄里的状态缓存，只在状态变化时写端口，不受这一条影响。
+ * 2、 节拍最好来自定时器中断（在中断里调 flashCtrl_ticks），别挂在长任务之后的主循环里：
+ *     主循环一旦被长任务拖慢，节拍跟着变长，flashCtrl_setThdMs 设的毫秒数就偏了。
+ * 3、 flashCtrl_start / flashCtrl_stop / flashCtrl_deinit 会改调度链表（摘链/挂链），
+ *     请在主循环里调用，不要放在 ticks 所在的中断里；中断里只调 flashCtrl_ticks。
+ * 4、 FLASH_CTRL_ACTUATOR_NUM 按实际用量收紧：内存池是静态占 RAM 的
+ *     （NUM * sizeof(FlashCtrl)）。项目定形后用 flashCtrl_getUsedCount() 读一次实际数量再调小。
+ * 5、 灯语的时长是全局一套（所有句柄共用），多个执行器要报不同错误码时，
+ *     靠“同一套时长 + 不同次数”区分；确实需要两套节奏时，就分别实例化各一份本库。
+ * 6、 句柄里的字段由库内逐项维护，调用方只把 flashCtrl_init 返回的指针存起来即可，
+ *     不要自行改写句柄成员（尤其 inUse、next、mode，改了会破坏内存池与调度链表）。
+ * 7、 灯语时长配置传 0 拍表示“跳过该阶段”：例如只想报长亮、不要短亮，就把 timesOfShort 传 0；
+ *     只给了 0 与很短时长的组合时，注意实际节拍是由 FLASH_CTRL_CYCLE_MS 换算并向上取整的。
+ */
+
 #include "userFlashCtrlCfg.h"
 
 #ifndef NULL
@@ -114,12 +134,13 @@ typedef struct FlashCtrl {
             uint16_t off_cnt;       /* 静止态已计节拍数，由库内维护 */
         } simple;
 #if FLASH_CTRL_LANG_EN
-        /* 灯语模式：长亮 N 次 + 短亮 M 次 + 收尾熄灭，跑完一轮自动进入下一轮 */
+        /* 灯语模式：长亮 N 次 + 短亮 M 次 + 收尾熄灭，跑完指定轮数后自停 */
         struct {
             uint16_t phaseCnt;      /* 当前阶段已计节拍数，由库内维护 */
-            uint16_t cycleCnt;      /* 已完成的整轮数，可查询/清零 */
+            uint16_t cycleCnt;      /* 已完成的整轮数，由库内维护 */
             uint8_t  longTotal;     /* 本轮需要长亮的次数，由触发接口设置 */
             uint8_t  shortTotal;    /* 本轮需要短亮的次数，由触发接口设置 */
+            uint8_t  cycles;        /* 触发时设定的总轮数，0 表示无限重复（由触发接口设置） */
             uint8_t  longDone;      /* 已完成长亮次数，由库内维护 */
             uint8_t  shortDone;     /* 已完成短亮次数，由库内维护 */
             uint8_t  phase;         /* 当前阶段，由库内维护 */
@@ -163,7 +184,8 @@ void flashCtrl_ticks(void);
 #if FLASH_CTRL_LANG_EN
 /* ---------------- 灯语模式 ----------------
  * 时序：起始熄灭(可选) → [长亮亮/长亮灭]*longTotal → 组间熄灭 → [短亮亮/短亮灭]*shortTotal → 收尾熄灭 → 下一轮
- * 一轮跑完自动开始下一轮，轮数由 flashCtrl_getLangCycle 查询，便于“同一个错误码报 N 轮再换下一个”。 */
+ * 轮数在触发时一次给定：跑满设定轮数后本灯语自停（停在熄灭态），由调用方检查跑完后切换下一个错误码，
+ * 因此不会出现“底层还在跑、应用层已换成新灯语”的半途切换。 */
 
 /* 灯语时长全局配置（所有句柄共用一套，配置一次即可）。
  * 各段熄灭时长是共用的，因此只需四个参数：
@@ -173,22 +195,29 @@ void flashCtrl_ticks(void);
  *   leadOff: 首尾熄灭时长（触发时执行器正亮着就先灭这么久；一轮跑完的收尾熄灭也用它）
  * 传 0 表示该时长 0 拍（该阶段被跳过）。
  * 例：报“2 次长亮 + 2 次短亮”，长亮亮 300ms、短亮亮 100ms、闪烁间熄灭 200ms、首尾各熄 700ms：
- *     flashCtrl_setLangCfgMs(300, 100, 200, 700);  再 flashCtrl_langTrigger(handle, 2, 2); */
+ *     flashCtrl_setLangCfgMs(300, 100, 200, 700);  再 flashCtrl_langTrigger(handle, 2, 2, 1); */
 void flashCtrl_setLangCfgCnt(uint16_t longOn, uint16_t shortOn, uint16_t gapOff, uint16_t leadOff);
 void flashCtrl_setLangCfgMs(uint16_t longOnMs, uint16_t shortOnMs, uint16_t gapOffMs, uint16_t leadOffMs);
 
-/* 触发灯语：设置本轮的长亮/短亮次数，并把轮数、进度清零后从头开始跑。
- * 次数传 0 表示该组不报；两者都传 0 表示取消灯语（回到空闲，不动执行器状态）。 */
-void flashCtrl_langTrigger(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOfShort);
+/* 触发灯语：设置本轮的长亮/短亮次数与需要重复的整轮数，并把轮数、进度清零后从头开始跑。
+ *   timesOfLong / timesOfShort: 长亮、短亮次数，传 0 表示该组不报；
+ *   cycles: 需要跑几整轮，跑满后自动停在熄灭态（等调用方查 flashCtrl_isLangDone 再切换）；
+ *           传 0 表示无限重复（用于常驻故障指示，需要主动停/切才结束）。
+ * 两个次数都传 0 表示取消灯语（回到空闲，不动执行器状态）。 */
+void flashCtrl_langTrigger(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOfShort, uint8_t cycles);
 
 /* 退出灯语、回到简单模式：灯语进度清零，执行器恢复按 on_thd / off_thd 周期闪烁，
  * 阈值沿用切到灯语模式之前设置的值（不必重设）。 */
 void flashCtrl_exitLangMode(FlashCtrl* handle);
 
-/* 查询已完成的整轮数（65535 封顶，不清零则一直保持）。 */
+/* 灯语是否已跑完设定轮数：1 已跑完（此时执行器停在熄灭态、不再推进），0 还在跑；
+ * cycles 传 0（无限重复）或当前不在灯语模式时，恒返回 0。 */
+uint8_t flashCtrl_isLangDone(FlashCtrl* handle);
+
+/* 查询已完成的整轮数（65535 封顶，跑满设定轮数后不再增长）。 */
 uint16_t flashCtrl_getLangCycle(FlashCtrl* handle);
 
-/* 只清零轮数，不影响正在跑的进度（同一错误码重新计次时用）。 */
+/* 只清零已完成的轮数（典型用途：同一错误码重新计次/重新触发前先清）。 */
 void flashCtrl_resetLangCycle(FlashCtrl* handle);
 #endif
 

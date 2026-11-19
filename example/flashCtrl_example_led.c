@@ -49,18 +49,20 @@ void main(void){
 
     while(1){
         delay_ms(10);        /* 固定节拍周期，须与 FLASH_CTRL_CYCLE_MS 一致 */
+        
+        // 在实际的项目中，推荐在中断里调用 flashCtrl_ticks()，保证节拍周期稳定
         flashCtrl_ticks();   /* 所有已启动的执行器在此推进节拍 */
 
         // 运行中修改闪烁时长（按毫秒指定，内部按 FLASH_CTRL_CYCLE_MS 换算成节拍数）
         // flashCtrl_setThdMs(led0, on_ms, off_ms);
 
         // 需要“长亮 N 次 + 短亮 M 次”这类灯语报错时，同一个句柄直接切成灯语模式即可（模式互斥）
-        // flashCtrl_langTrigger(led0, 3, 2);           // 触发：只给次数（3 次长亮 + 2 次短亮），跑完自动重复
+        // flashCtrl_langTrigger(led0, 3, 2, 2);        // 触发：3 次长亮 + 2 次短亮，报 2 轮后自停（cycles=0 为无限重复）
 
-        // 灯语跑满 3 轮后切换到下一个错误码（跑完自动重复，所以何时切换由用户决定）
-        // if (flashCtrl_getLangCycle(led0) >= 3) { 
-        //     flashCtrl_resetLangCycle(led0); 
-        //     flashCtrl_langTrigger(led0, 3, 1); 
+        // 灯语跑满设定轮数后自停（停在熄灭态），应用层在这里轮询：
+        // 轮询慢一点只是让灯多灭一会儿，不会出现“报一半就被换掉”的情况
+        // if (flashCtrl_isLangDone(led0)) {
+        //     flashCtrl_langTrigger(led0, 3, 1, 2);     // 换下一个错误码，3长1短，报2次
         // }
 
         // 不再用灯语时切回周期闪烁（阈值沿用切走前的值，不用重设）

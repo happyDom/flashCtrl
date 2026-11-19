@@ -94,7 +94,7 @@ example/
 两种模式的进度共用同一块句柄内存（联合体），而简单模式的阈值放在联合体外面，
 所以来回切换时阈值不会丢，句柄也不会因为多了一种模式而明显变大。
 
-灯的时序由**全局**配置一次，所有句柄共用；触发时只给次数。
+灯的时序由**全局**配置一次，所有句柄共用；触发时给“长/短次数 + 要跑几轮”。
 各段“熄灭”时长是共用的，因此配置只需四个时长：
 
 | 参数 | 含义 |
@@ -108,10 +108,11 @@ example/
 | --- | --- |
 | `flashCtrl_setLangCfgCnt(longOn, shortOn, gapOff, leadOff)` | 按节拍数配置灯语各段时长 |
 | `flashCtrl_setLangCfgMs(longOnMs, shortOnMs, gapOffMs, leadOffMs)` | 同上，但按毫秒数给，库内用 `FLASH_CTRL_CYCLE_MS` 换算成节拍数 |
-| `flashCtrl_langTrigger(handle, timesOfLong, timesOfShort)` | 触发灯语：指定长亮 / 短亮次数，轮数与进度清零后从头跑；两者都传 0 表示取消（回空闲、不动执行器） |
+| `flashCtrl_langTrigger(handle, timesOfLong, timesOfShort, cycles)` | 触发灯语：指定长亮 / 短亮次数和要跑的整轮数；跑满 `cycles` 轮后**自停**（停在熄灭态）。两个次数都传 0 表示取消（回空闲、不动执行器）；`cycles` 传 0 表示无限重复 |
+| `flashCtrl_isLangDone(handle)` | 是否已跑完设定轮数：1 已跑完、0 还在跑（`cycles = 0` 或不在灯语模式时恒为 0） |
 | `flashCtrl_exitLangMode(handle)` | 退出灯语、回到简单模式，恢复按 `on_thd` / `off_thd` 周期闪烁（阈值沿用切走前的值） |
-| `flashCtrl_getLangCycle(handle)` | 查询已完成的整轮数（65535 封顶） |
-| `flashCtrl_resetLangCycle(handle)` | 只清零轮数，不影响正在跑的进度 |
+| `flashCtrl_getLangCycle(handle)` | 查询已完成的整轮数（65535 封顶，跑满设定轮数后不再增长） |
+| `flashCtrl_resetLangCycle(handle)` | 只清零已完成的轮数 |
 
 一轮的时序：
 
@@ -119,28 +120,71 @@ example/
 起始熄灭(可选，leadOff) → [长亮 on]*N → 熄灭(gapOff) → … → 组间熄灭(gapOff) → [短亮 on]*M → … → 收尾熄灭(leadOff) → 下一轮
 ```
 
-- 一轮跑完**自动进入下一轮**，因此“同一个错误码报 N 轮再换下一个”只需查 `flashCtrl_getLangCycle`；
+- **轮数在触发时一次给定，跑满就自停**：不会出现“底层还在跑、应用层已经换成新灯语”的半途切换。
+  代价是收尾熄灭之后的空闲会一直持续到应用层来切换（应用层慢一点，灯就多灭一会儿），
+  但这比“报一半被打断”可接受；
+- 跑满后 `flashCtrl_isLangDone()` 返回 1，此时执行器停在熄灭态、`ticks` 对本句柄不再写端口；
+  应用层据此切换下一个错误码（在轮询周期里检查即可）；
+- `cycles` 传 0 表示无限重复（常驻故障指示），此时 `isLangDone` 恒为 0，需要主动取消或切换；
 - **起始熄灭是按需的**：触发时执行器正亮着才先灭 `leadOff` 拍（与简单模式 toggle 的口径一致）；
   触发时本就熄灭，则直接进入长亮组，不再额外延长一个熄灭周期；
 - 任一段时长配置为 0 拍即跳过该阶段；`timesOfLong = 0` 时不报长亮组（组间熄灭也一并跳过）；
 - 长亮次数用完后才进入短亮组，两组之间同样用 `gapOff` 分隔；
 - 一轮结束时用 `leadOff` 收尾，这个收尾熄灭同时也是两轮之间的间隔；
 - 各段的“灭”共用 `gapOff`（`leadOff` 只管首尾），所以灯语的节奏是均匀的：亮时长决定长短，灭时长统一；
-- 停止/取消：取消用 `flashCtrl_langTrigger(handle, 0, 0)`（回空闲、不动硬件）；
+- 停止/取消：取消用 `flashCtrl_langTrigger(handle, 0, 0, 0)`（回空闲、不动硬件）；
   连调度一起停并指定末态，用 `flashCtrl_stop(handle, offState)`，口径与简单模式完全相同。
 
-示例（2 次长亮 + 2 次短亮；长亮亮 300ms、短亮亮 100ms、闪烁间熄灭 200ms、首尾各熄 700ms）：
+示例（2 次长亮 + 2 次短亮、报 3 轮；长亮亮 300ms、短亮亮 100ms、闪烁间熄灭 200ms、首尾各熄 700ms）：
 
 ```c
-flashCtrl_setLangCfgMs(300, 100, 200, 700);                 /* 全局配置一次 */
-flashCtrl_langTrigger(led0, 2, 2);                          /* 触发：只给次数 */
-if (flashCtrl_getLangCycle(led0) >= 2) {                    /* 报够 2 轮 */
-    flashCtrl_langTrigger(led0, 0, 0);                      /* 取消当前灯语 */
-    flashCtrl_langTrigger(led0, 3, 1);                      /* 换下一个错误码 */
+flashCtrl_setLangCfgMs(300, 100, 200, 700);           /* 全局配置一次 */
+flashCtrl_langTrigger(led0, 2, 2, 3);                  /* 报 3 轮，跑满自停 */
+
+/* 在主循环里轮询（应用层慢一点没关系，灯只是多灭一会儿） */
+if (flashCtrl_isLangDone(led0)) {
+    flashCtrl_langTrigger(led0, 3, 1, 1);              /* 直接换下一个错误码，不必先取消 */
 }
 
-flashCtrl_exitLangMode(led0);                              /* 不再用灯语：切回周期闪烁，原阈值仍在 */
+/* 常驻故障（一直报，直到故障消失） */
+flashCtrl_langTrigger(led0, 1, 0, 0);                  /* cycles = 0：无限重复 */
+flashCtrl_langTrigger(led0, 0, 0, 0);                  /* 故障消失：取消 */
+
+flashCtrl_exitLangMode(led0);                          /* 不再用灯语：切回周期闪烁，原阈值仍在 */
 ```
+
+> 切换下一个错误码时不需要先 `langTrigger(h, 0, 0, 0)`：跑满后本句柄已停在熄灭态，
+> 直接触发新的一次即可（新灯语从熄灭态开始，不会再插一段起始熄灭）。
+
+#### 常见错误码灯语对照表（可直接照抄，按需增删）
+
+灯语时长是**全局一套**，所以下面所有错误码共用一组时长，只靠“长亮 / 短亮次数”区分。
+参考配置（调度周期 10ms 时）：
+
+```c
+flashCtrl_setLangCfgMs(500, 150, 300, 1200);   /* 长亮亮 500ms、短亮亮 150ms、闪烁间熄灭 300ms、首尾各熄 1200ms */
+```
+
+| 灯语 | 长亮次数 | 短亮次数 | 报几轮（建议） | 典型含义 / 用途 |
+| --- | --- | --- | --- | --- |
+| 不报（灯语取消） | 0 | 0 | — | 待机、正常，灯由业务自己控制 |
+| 1 长 | 1 | 0 | 2~3 | 电源异常（欠压 / 过压 / 掉电重启） |
+| 2 长 | 2 | 0 | 2~3 | 传感器异常（开路、短路、无响应） |
+| 3 长 | 3 | 0 | 2~3 | 通信超时（总线 / 上位机无应答） |
+| 1 长 1 短 | 1 | 1 | 3 | 低电量 / 需要提醒的告警 |
+| 2 长 1 短 | 2 | 1 | 3 | 过温保护（降额运行中） |
+| 3 长 1 短 | 3 | 1 | 3 | 过流保护（输出已关断） |
+| 1 长 2 短 | 1 | 2 | 3 | 参数 / 存储器错误（校验失败、写入失败） |
+| 2 长 2 短 | 2 | 2 | 0（常驻） | 自检中、标定中（进度提示） |
+
+几点约定（按这几点做，肉眼最容易分辨）：
+
+- **长亮次数少、短亮次数多**更容易辨：长亮代表“大类”，短亮代表“具体项”，看长亮次数一眼就知道是哪一类；
+- 同一时刻只报一个错误码：`langTrigger(h, 长, 短, 轮数)` 一次给定轮数，跑满自停后再切下一个；
+- 切换的判据是 `flashCtrl_isLangDone(h)`（不是“已经跑到第几轮”），这样应用层轮询慢也不会有半途切换；
+- 致命故障（需要断电复位）建议不用灯语，直接用简单模式高频闪烁：`flashCtrl_setThdMs(h, 50, 50)`；
+- “一直报到故障消失”这类常驻指示，用 `cycles = 0`（无限重复），故障消失时 `langTrigger(h, 0, 0, 0)` 取消；
+- 若觉得“只亮一下就过去了”，通常是 `gapOff` / `leadOff` 配得太大，先缩这两个值，再调亮时长。
 
 ### 节拍语义
 
