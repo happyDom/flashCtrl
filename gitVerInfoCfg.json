@@ -1,6 +1,6 @@
 {
-	"productId": "xxx-xx",
-	"projectName":"projectName",
+	"productId": "bafe86a4-16cd-7224-43ef-3bade664a68a",
+	"projectName":"flashCtrl",
 	"objsToBePublished":"file1, file2@copy, file3",
 	"objsToBePublishedComment":"可以通过，分隔多个文件，文件名后以@表示发布广工，例如 file1@copy, file2@move，如果不标，默认是move",
 	"tgtDirForPublishing":"e:/demo",
