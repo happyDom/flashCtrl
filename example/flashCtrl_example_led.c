@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * flashCtrl_example_led.c —— flashCtrl 库的调用方示例
  *

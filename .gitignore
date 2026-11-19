@@ -225,3 +225,26 @@ Version.h
 *logger*
 *exvim*
 utils
+
+# ==== flashCtrl 编译/调试产物（MSVC / GCC / ARM、Keil MDK）====
+# 可执行、符号、中间对象
+*.exe
+*.out
+*.elf
+*.dll
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.s19
+*.su
+*.gcda
+*.gcno
+*.gcov
+# 工具缓存与编译数据库
+compile_commands.json
+.clangd/
+.cache/
+# Keil MDK5 备份文件（uvguix/uvoptx 已有规则，这里补 .bak）
+*.uvprojx.bak
+*.uvoptx.bak
