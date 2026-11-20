@@ -68,15 +68,15 @@ example/
 | 类型 | 说明 |
 | --- | --- |
 | `io_ctrl_func` | `void (*)(void)`，执行器控制动作（进入动作态 / 进入静止态） |
-| `io_sts_func` | `uint8_t (*)(void)`，读取执行器状态；返回 0 表示动作态（点亮 / 鸣叫），返回 1 表示静止态（熄灭 / 静默） |
-| `flashCtrlOffState_t` | `flashCtrl_stop` / `flashCtrl_deinit` 的末态参数：`FLASH_CTRL_STS_KEEP` 保持原状、`FLASH_CTRL_STS_ACTIVE` 停在动作态、`FLASH_CTRL_STS_IDLE` 停在静止态（与 `get_sts` 返回值含义无关，避免混淆） |
+| `io_is_on_func` | `uint8_t (*)(void)`，读取执行器**是否处于动作态**；返回 1 表示动作态（点亮 / 鸣叫），返回 0 表示静止态（熄灭 / 静默）。语义与命名同向，可以直接注册 `isTurnOn()` 这类函数；低电平点亮的 LED 写成 `return (P42 ? 0 : 1);` |
+| `flashCtrlOffState_t` | `flashCtrl_stop` / `flashCtrl_deinit` 的末态参数：`FLASH_CTRL_STS_KEEP` 保持原状、`FLASH_CTRL_STS_ACTIVE` 停在动作态、`FLASH_CTRL_STS_IDLE` 停在静止态（与 `is_on` 返回值含义无关，避免混淆） |
 | `FlashCtrl` | 控制句柄，一个句柄对应一个执行器；由库内内存池分配，阈值与计数由库内维护 |
 
 ### 方法
 
 | 方法 | 说明 |
 | --- | --- |
-| `flashCtrl_init(turn_on, turn_off, get_sts)` | 在静态内存池中分配句柄并登记动作函数（`turn_on` 对应原 `clear_P42`，`turn_off` 对应原 `set_P42`）与状态读取函数（对应原 `getP42Sts`）；返回句柄，池满返回 `NULL` |
+| `flashCtrl_init(turn_on, turn_off, is_on)` | 在静态内存池中分配句柄并登记动作函数（`turn_on` 对应原 `clear_P42`，`turn_off` 对应原 `set_P42`）与状态读取函数（对应原 `getP42Sts`，需改成 1=亮 的语义）；返回句柄，池满返回 0 |
 | `flashCtrl_deinit(handle, offState)` | 先按 `offState` 停止节拍控制（口径与 `flashCtrl_stop` 相同），再清空槽位、归还内存池，槽位可被后续 `init` 复用；`KEEP` 表示只回收资源、不动执行器 |
 | `flashCtrl_getUsedCount()` | 查询已分配的句柄数量 |
 | `flashCtrl_getCapacity()` | 查询内存池容量（即 `FLASH_CTRL_ACTUATOR_NUM`） |
@@ -208,9 +208,9 @@ static FlashCtrl* led0 = NULL;
 
 static void led0_turn_on(void)    { P42 = 0; }              /* 拉低点亮 */
 static void led0_turn_off(void)   { P42 = 1; }              /* 拉高熄灭 */
-static uint8_t led0_get_sts(void) { return P42 ? 1 : 0; }   /* 0：点亮，1：熄灭 */
+static uint8_t led0_is_on(void)   { return P42 ? 0 : 1; }   /* 1：点亮，0：熄灭 */
 
-led0 = flashCtrl_init(led0_turn_on, led0_turn_off, led0_get_sts);
+led0 = flashCtrl_init(led0_turn_on, led0_turn_off, led0_is_on);
 if (NULL == led0) { /* 池满：调大 FLASH_CTRL_ACTUATOR_NUM */ }
 
 flashCtrl_setThdMs(led0, 50, 150);       /* 亮 50ms、灭 150ms（10ms 一拍下即 5 拍 / 15 拍） */

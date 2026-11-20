@@ -17,31 +17,31 @@
 /* ---------------- 执行器一：板载 LED ---------------- */
 #define LED0_ON()   (P42 = 0)                       /* P42 拉低，板载 LED 点亮 */
 #define LED0_OFF()  (P42 = 1)                       /* P42 拉高，板载 LED 熄灭 */
-#define LED0_STS()  ((uint8_t)(P42 ? 1 : 0))         /* 0：点亮，1：熄灭 */
+#define LED0_ON_STS() ((uint8_t)(P42 ? 0 : 1))       /* 1：点亮（引脚为 0），0：熄灭 */
 
 static FlashCtrl* led0 = 0;      /* 库内分配的句柄，外部只记录指针 */
 
 static void led0_turn_on(void)    { LED0_ON();  }
 static void led0_turn_off(void)   { LED0_OFF(); }
-static uint8_t led0_get_sts(void) { return LED0_STS(); }
+static uint8_t led0_is_on(void)   { return LED0_ON_STS(); }   /* 1=亮 / 0=灭，与 io_is_on_func 语义同向 */
 
 /* ---------------- 执行器二：蜂鸣器（同一个库，换个执行器即可） ---------------- */
 #define BEEP_ON()   (P10 = 0)
 #define BEEP_OFF()  (P10 = 1)
-#define BEEP_STS()  ((uint8_t)(P10 ? 1 : 0))
+#define BEEP_ON_STS() ((uint8_t)(P10 ? 0 : 1))     /* 1：鸣叫（引脚为 0），0：静默 */
 
 static FlashCtrl* buzzer = 0;
 
 static void buzzer_turn_on(void)    { BEEP_ON();  }
 static void buzzer_turn_off(void)   { BEEP_OFF(); }
-static uint8_t buzzer_get_sts(void) { return BEEP_STS(); }
+static uint8_t buzzer_is_on(void)  { return BEEP_ON_STS(); }
 
 void main(void){
-    led0 = flashCtrl_init(led0_turn_on, led0_turn_off, led0_get_sts);   // 注册失败时返回 0（空指针），由调用方自行处理
+    led0 = flashCtrl_init(led0_turn_on, led0_turn_off, led0_is_on);   // 注册失败时返回 0（空指针），由调用方自行处理
     flashCtrl_setThdMs(led0, 50, 150);  // 亮 50ms、灭 150ms（10ms 一拍下即 5 拍 / 15 拍）
     flashCtrl_start(led0);              // 提交启动请求，由 flashCtrl_ticks() 在下一拍挂链（异步）
 
-    buzzer = flashCtrl_init(buzzer_turn_on, buzzer_turn_off, buzzer_get_sts);
+    buzzer = flashCtrl_init(buzzer_turn_on, buzzer_turn_off, buzzer_is_on);
     flashCtrl_setThdMs(buzzer, 20, 280);   // 鸣 20ms、停 280ms（10ms 一拍 → 2 拍 / 28 拍）
     flashCtrl_start(buzzer);            // 同上：请求式，下一拍生效
 

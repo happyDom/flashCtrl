@@ -32,7 +32,9 @@
  */
 
 /* 使用注意（都是实际集成到项目时踩过的坑，照着做能省不少调试时间）
- * 1、 get_sts 必须真读端口状态（如 P42 ? 1 : 0），不要返回软件标志位。
+ * 1、 is_on 必须真读端口状态，不要返回软件标志位。语义与命名同向：
+ *     返回 1 = 动作态（亮 / 鸣叫），返回 0 = 静止态（灭 / 静默）。
+ *     因此“低电平点亮”的 LED 要写成 return (P42 ? 0 : 1);（引脚读到 0 才代表亮）。
  *     简单模式每一拍都靠它判断执行器当前状态，标志位一旦与硬件不一致（别的逻辑改了灯、
  *     上电初值不同、被外部强行拉低……）就会“跑飞”：该灭的时候不灭、该亮的时候不亮。
  *     灯语模式内部用句柄里的状态缓存，只在状态变化时写端口，不受这一条影响。
@@ -91,17 +93,18 @@
 extern "C" {
 #endif
 
-/* 执行器控制函数类型：由调用方实现“动作、停止”的具体动作
- * （如：拉低端口点亮 LED、拉高端口熄灭 LED、使能蜂鸣器等） */
+/* 执行器控制函数类型：由调用方实现“动作、停止”的具体动作 */
 typedef void (*io_ctrl_func)(void);
 
-/* 执行器状态读取函数类型：由调用方实现当前状态读取
- * 返回 0：执行器处于“动作态”（LED 点亮、蜂鸣器鸣叫……）
- * 返回 1：执行器处于“静止态”（LED 熄灭、蜂鸣器静默……） */
-typedef uint8_t (*io_sts_func)(void);
+/* 执行器状态读取函数类型：由调用方实现“当前是否处于动作态”的读取。
+ * 返回 1：执行器处于“动作态”（LED 点亮、蜂鸣器鸣叫……）
+ * 返回 0：执行器处于“静止态”（LED 熄灭、蜂鸣器静默……）
+ * 语义与函数名同向（is_on），因此可以直接把“isTurnOn()”这类用户函数注册进来；
+ * 低电平点亮的 LED 写成 return (P42 ? 0 : 1);。 */
+typedef uint8_t (*io_is_on_func)(void);
 
 /* 停止节拍控制时，执行器的末态要求（用于 flashCtrl_stop / flashCtrl_deinit 的参数，
- * 与 get_sts 的返回值含义无关，避免两者混淆故单独定义） */
+ * 与 is_on 的返回值含义无关，避免两者混淆故单独定义） */
 typedef enum {
     FLASH_CTRL_STS_KEEP   = 0,   /* 保持执行器当前状态，不做任何切换 */
     FLASH_CTRL_STS_ACTIVE = 1,   /* 停止后进入动作态（点亮 LED / 蜂鸣器鸣叫） */
@@ -123,7 +126,7 @@ typedef enum {
 typedef struct FlashCtrl {
     io_ctrl_func turn_on;   /* 进入动作态的注册函数 */
     io_ctrl_func turn_off;  /* 进入静默态的注册函数 */
-    io_sts_func  get_sts;   /* 状态读取的注册函数 */
+    io_is_on_func is_on;    /* 状态读取的注册函数：1 = 动作态（亮），0 = 静止态（灭） */
     uint16_t     on_thd;    /* 简单模式：动作态节拍数，0：不动作（保持静止） */
     uint16_t     off_thd;   /* 简单模式：静止态节拍数，0：不停止（保持动作） */
     uint8_t      mode;      /* flashCtrlMode_t，由库内维护 */
@@ -152,15 +155,15 @@ typedef struct FlashCtrl {
             uint8_t  longDone;      /* 已完成长亮次数，由库内维护 */
             uint8_t  shortDone;     /* 已完成短亮次数，由库内维护 */
             uint8_t  phase;         /* 当前阶段，由库内维护 */
-            uint8_t  lit;           /* 执行器状态缓存（0：动作态，1：静止态），由库内维护 */
+            uint8_t  isOn;          /* 执行器状态缓存（1：动作态/亮，0：静止态/灭），由库内维护 */
         } lang;
 #endif
     } u;
 } FlashCtrl;
 
-/* 在库内静态内存池中分配一个句柄，并登记执行器的动作/停止/状态读取函数。
- * 返回 0（空指针）表示内存池已满（需要调大 FLASH_CTRL_ACTUATOR_NUM）或 get_sts 非法。 */
-FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_sts_func get_sts);
+/* 在库内静态内存池中分配一个句柄，并登记执行器的 动作 / 停止 / 状态读取 函数。
+ * 返回 0（空指针）表示内存池已满（需要调大 FLASH_CTRL_ACTUATOR_NUM）或 is_on 传了空指针。 */
+FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_is_on_func is_on);
 
 /* 请求释放（异步）：只登记请求，实际摘链 + 末态处理 + 归还槽位由 flashCtrl_ticks() 在下一拍执行，
  * 口径与 flashCtrl_stop 完全一致。offState 传 FLASH_CTRL_STS_KEEP 表示只回收资源、不动执行器。
