@@ -654,6 +654,26 @@ void flashCtrl_stop(FlashCtrl* handle, flashCtrlOffState_t offState) {
     handle->pendingReq      = FLASH_REQ_STOP;
 }
 
+/**
+  * @brief  把执行器固定为“常亮”（动作态）：语义糖，等价于 flashCtrl_setThdMs(handle, 1, 0)。
+  *         off_thd=0 表示“不熄灭”，故一旦进入动作态就保持；on_thd 的 1 只是占位。
+  * @param  handle: 闪烁控制句柄（需已 start，否则只改阈值、无人推进）
+  * @retval None
+  */
+void flashCtrl_turnOn(FlashCtrl* handle) {
+    flashCtrl_setThdMs(handle, 1, 0);
+}
+
+/**
+  * @brief  把执行器固定为“常灭”（静止态）：语义糖，等价于 flashCtrl_setThdMs(handle, 0, 1)。
+  *         on_thd=0 表示“不点亮”，故一旦进入静止态就保持；off_thd 的 1 只是占位。
+  * @param  handle: 闪烁控制句柄（需已 start，否则只改阈值、无人推进）
+  * @retval None
+  */
+void flashCtrl_turnOff(FlashCtrl* handle) {
+    flashCtrl_setThdMs(handle, 0, 1);
+}
+
 /* 实际的摘链 + 末态处理：只在 flashCtrl_ticks() -> serviceRequests() 里执行 */
 static void doStop(FlashCtrl* handle, flashCtrlOffState_t offState) {
     FlashCtrl** curr;

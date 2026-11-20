@@ -74,5 +74,10 @@ void main(void){
 
         // 也可以彻底释放：先按指定末态停止（这里停成熄灭），再归还句柄（资源供其它执行器复用）
         // flashCtrl_deinit(led0, FLASH_CTRL_STS_IDLE);   /* 归还内存池资源；KEEP 则只回收资源、不动 LED */
+
+        // 需要“非闪烁”的稳态时（常亮 / 常灭），直接用这两个接口，不必自己去凑阈值：
+        // flashCtrl_turnOn(led0);        // 常亮 = setThdMs(1, 0)：off=0 不熄灭，点亮后保持
+        // flashCtrl_turnOff(led0);       // 常灭 = setThdMs(0, 1)：on=0 不点亮，熄灭后保持
+        // 之后想恢复闪烁：flashCtrl_setThdMs(led0, 500, 500);  （句柄一直在链表里，不用再 start）
     }
 }

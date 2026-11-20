@@ -84,6 +84,8 @@ example/
 | `flashCtrl_reset(handle)` | 清零当前阶段进度：简单模式清节拍计数，灯语模式清阶段计时；不改变阈值、模式与执行器状态 |
 | `flashCtrl_start(handle)` | 把句柄加入工作链表，重复加入返回 -1 |
 | `flashCtrl_stop(handle, offState)` | 把句柄移出工作链表，并按 `offState` 指定停止时的执行器末态：`KEEP` 不动硬件、`ACTIVE` 停在动作态、`IDLE` 停在静止态（后两者会切换状态并清零节拍计数） |
+| `flashCtrl_turnOn(handle)` | 把执行器固定为**常亮**（动作态）：语义糖，等价 `flashCtrl_setThdMs(handle, 1, 0)`——`off_thd=0` 表示“不熄灭”，故点亮后一直保持；句柄仍留在节拍链表里 |
+| `flashCtrl_turnOff(handle)` | 把执行器固定为**常灭**（静止态）：语义糖，等价 `flashCtrl_setThdMs(handle, 0, 1)`——`on_thd=0` 表示“不点亮”，故熄灭后一直保持 |
 | `flashCtrl_ticks()` | 节拍调度，按固定周期调用即可推进所有已启动的句柄 |
 
 > 单个句柄的节拍处理（即通用化后的 `led0_toggle()`）是库内私有函数，由 `flashCtrl_ticks` 内部调用，不对外暴露。

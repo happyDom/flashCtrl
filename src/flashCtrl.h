@@ -194,6 +194,24 @@ int flashCtrl_start(FlashCtrl* handle);
  * （FLASH_CTRL_STS_KEEP 不改动执行器；ACTIVE/IDLE 会切换状态并清零节拍计数）。 */
 void flashCtrl_stop(FlashCtrl* handle, flashCtrlOffState_t offState);
 
+/* ---------------- 两个“稳态”快捷接口（语义糖） ----------------
+ * 作用：让“常亮 / 常灭”这个意图在调用处一眼可见，不必自己去凑阈值。
+ * 实现上就是阈值的一个特例，句柄照旧留在节拍链表里：
+ *   flashCtrl_turnOn (h) ≡ flashCtrl_setThdMs(h, 1, 0)   → 熄灭态一拍内被点亮，之后保持
+ *   flashCtrl_turnOff(h) ≡ flashCtrl_setThdMs(h, 0, 1)   → 点亮态一拍内被熄灭，之后保持
+ * 为什么这样可行（简单模式的判据）：
+ *   - off_thd = 0 表示“不熄灭”，于是只要处于动作态就永远停在那里（on_thd 不参与判断）；
+ *   - on_thd  = 0 表示“不点亮”，于是只要处于静止态就永远停在那里（off_thd 不参与判断）。
+ *   - 那个 1 只是“让对应相位成立”的占位值（1ms 折算 1 拍，值本身不会被用到）。
+ * 要点：
+ *   - 同步：立即改写阈值并清节拍计数，下一拍由 flashCtrl_ticks 把执行器带到目标态；句柄必须已经 start，
+ *     否则只改了阈值、没人推进；
+ *   - 每拍都会按 is_on 纠偏：期间若有别的代码直接动了端口，下一拍会被拉回目标态；
+ *   - 会覆盖之前的 on_thd / off_thd（并切回简单模式，退出灯语），想恢复闪烁要重新 setThdMs；
+ *   - 句柄为 0（空指针）时安全返回。 */
+void flashCtrl_turnOn(FlashCtrl* handle);
+void flashCtrl_turnOff(FlashCtrl* handle);
+
 /* 节拍调度：先执行主循环提交的启动/停止/释放请求（链表只在这里被改动，
  * 调用方无需再加临界区），再推进所有已挂链句柄的节拍。 */
 void flashCtrl_ticks(void);
