@@ -26,7 +26,7 @@
  *      轮数在触发时一次给定，跑满设定轮数后自停（停在熄灭态），调用方查 flashCtrl_isLangDone
  *      后再切换下一个错误码；cycles 传 0 表示无限重复（常驻故障指示）。
  *
- * 模式切换：flashCtrl_langTrigger 切到灯语模式，flashCtrl_exitLangMode（或 setThdMs）
+ * 模式切换：flashCtrl_startLang 切到灯语模式，flashCtrl_exitLangMode（或 setThdMs）
  * 切回简单模式；简单模式的阈值存放在联合体外面，所以来回切换时阈值不会丢。
  */
 
@@ -520,14 +520,14 @@ void flashCtrl_setLangCfgMs(uint16_t longOnMs, uint16_t shortOnMs, uint16_t gapO
 }
 
 /**
-  * @brief  触发一次灯语：设置本轮的长亮/短亮次数与需要重复的整轮数，轮数与进度清零后从头开始跑。
+  * @brief  开始一轮灯语：设置本轮的长亮/短亮次数与需要重复的整轮数，轮数与进度清零后从头开始跑。
   * @param  handle:       闪烁控制句柄
   * @param  timesOfLong:  长亮次数（0：不报长亮组）
   * @param  timesOfShort: 短亮次数（0：不报短亮组；两者都为 0 表示取消灯语）
   * @param  cycles:       需要跑几整轮，跑满后自动停在熄灭态；0 表示无限重复
   * @retval None
   */
-void flashCtrl_langTrigger(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOfShort, uint8_t cycles) {
+void flashCtrl_startLang(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOfShort, uint8_t cycles) {
     if(0 == handle || 0 == handle->inUse) return;
 
     handle->mode = FLASH_CTRL_MODE_LANG;

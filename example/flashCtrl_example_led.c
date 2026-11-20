@@ -58,12 +58,12 @@ void main(void){
         // flashCtrl_setThdMs(led0, on_ms, off_ms);
 
         // 需要“长亮 N 次 + 短亮 M 次”这类灯语报错时，同一个句柄直接切成灯语模式即可（模式互斥）
-        // flashCtrl_langTrigger(led0, 3, 2, 2);        // 触发：3 次长亮 + 2 次短亮，报 2 轮后自停（cycles=0 为无限重复）
+        // flashCtrl_startLang(led0, 3, 2, 2);        // 触发：3 次长亮 + 2 次短亮，报 2 轮后自停（cycles=0 为无限重复）
 
         // 灯语跑满设定轮数后自停（停在熄灭态），应用层在这里轮询：
         // 轮询慢一点只是让灯多灭一会儿，不会出现“报一半就被换掉”的情况
         // if (flashCtrl_isLangDone(led0)) {
-        //     flashCtrl_langTrigger(led0, 3, 1, 2);     // 换下一个错误码，3长1短，报2次
+        //     flashCtrl_startLang(led0, 3, 1, 2);     // 换下一个错误码，3长1短，报2次
         // }
 
         // 不再用灯语时切回周期闪烁（阈值沿用切走前的值，不用重设）

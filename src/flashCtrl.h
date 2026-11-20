@@ -248,15 +248,16 @@ void flashCtrl_ticks(void);
  *   leadOff: 首尾熄灭时长（触发时执行器正亮着就先灭这么久；一轮跑完的收尾熄灭也用它）
  * 传 0 毫秒表示该阶段被跳过。
  * 例：报“2 次长亮 + 2 次短亮”，长亮亮 300ms、短亮亮 100ms、闪烁间熄灭 200ms、首尾各熄 700ms：
- *     flashCtrl_setLangCfgMs(300, 100, 200, 700);  再 flashCtrl_langTrigger(handle, 2, 2, 1); */
+ *     flashCtrl_setLangCfgMs(300, 100, 200, 700);  再 flashCtrl_startLang(handle, 2, 2, 1); */
 void flashCtrl_setLangCfgMs(uint16_t longOnMs, uint16_t shortOnMs, uint16_t gapOffMs, uint16_t leadOffMs);
 
-/* 触发灯语：设置本轮的长亮/短亮次数与需要重复的整轮数，并把轮数、进度清零后从头开始跑。
+/* 开始灯语：设置本轮的长亮/短亮次数与需要重复的整轮数，并把轮数、进度清零后从头开始跑。
+ * 已在跑灯语的句柄可直接再调一次换下一个灯语（旧进度作废，立即从新灯语的第一段开始）。
  *   timesOfLong / timesOfShort: 长亮、短亮次数，传 0 表示该组不报；
  *   cycles: 需要跑几整轮，跑满后自动停在熄灭态（等调用方查 flashCtrl_isLangDone 再切换）；
  *           传 0 表示无限重复（用于常驻故障指示，需要主动停/切才结束）。
  * 两个次数都传 0 表示取消灯语（回到空闲，不动执行器状态）。 */
-void flashCtrl_langTrigger(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOfShort, uint8_t cycles);
+void flashCtrl_startLang(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOfShort, uint8_t cycles);
 
 /* 退出灯语、回到简单模式：灯语进度清零，执行器恢复按 on_thd / off_thd 周期闪烁，
  * 阈值沿用切到灯语模式之前设置的值（不必重设）。 */
