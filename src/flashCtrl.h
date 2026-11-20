@@ -38,27 +38,28 @@
  *     灯语模式内部用句柄里的状态缓存，只在状态变化时写端口，不受这一条影响。
  * 2、 节拍最好来自定时器中断（在中断里调 flashCtrl_ticks），别挂在长任务之后的主循环里：
  *     主循环一旦被长任务拖慢，节拍跟着变长，flashCtrl_setThdMs 设的毫秒数就偏了。
- * 3、 flashCtrl_start / flashCtrl_stop / flashCtrl_deinit 会改调度链表（摘链/挂链），
- *     请在主循环里调用，不要放在 ticks 所在的中断里；中断里只调 flashCtrl_ticks。
+ * 3、 调度链表只在 flashCtrl_ticks() 的上下文里被改动：start / stop / deinit 都是“提交请求”
+ *     （只写句柄里的两个单字节，不碰任何链表指针），实际的挂链/摘链由 ticks 在下一拍执行。
+ *     因此主循环可以随时调用它们，不必自己加临界区，也不会出现
+ *     “ticks 正在遍历链表、主循环同时摘链”的竞争；代价是启停最多延后一拍生效。
+ *     附带好处：8051 上 2 字节指针的写入不是原子的，把链表改动全部收进同一个上下文，
+ *     也避免了 ISR 读到“半个地址”的可能。
+ *     注意：停止/释放时的末态处理也在 ticks 里执行，因此 turn_on / turn_off 可能在中断上下文
+ *     被调用，实现必须短小、可重入、不阻塞，且不要在里面再调用本库的 start/stop/deinit。
  * 4、 FLASH_CTRL_ACTUATOR_NUM 按实际用量收紧：内存池是静态占 RAM 的
  *     （NUM * sizeof(FlashCtrl)）。项目定形后用 flashCtrl_getUsedCount() 读一次实际数量再调小。
  * 5、 灯语的时长是全局一套（所有句柄共用），多个执行器要报不同错误码时，
  *     靠“同一套时长 + 不同次数”区分；确实需要两套节奏时，就分别实例化各一份本库。
  * 6、 句柄里的字段由库内逐项维护，调用方只把 flashCtrl_init 返回的指针存起来即可，
  *     不要自行改写句柄成员（尤其 inUse、next、mode，改了会破坏内存池与调度链表）。
- * 7、 灯语时长配置传 0 拍表示“跳过该阶段”：例如只想报长亮、不要短亮，就把 timesOfShort 传 0；
- *     只给了 0 与很短时长的组合时，注意实际节拍是由 FLASH_CTRL_CYCLE_MS 换算并向上取整的。
+ * 7、 灯语时长配置传 0 表示“跳过该阶段”：例如只想报长亮、不要短亮，就把 timesOfShort 传 0；
+ *     给很短的毫秒数时注意：实际时长 = 拍数 × FLASH_CTRL_CYCLE_MS，10ms 一拍时给 5ms 实际就是 10ms。
+ * 8、 对外的时长接口一律用毫秒（setThdMs / setLangCfgMs），库内不暴露“节拍数”接口：
+ *     这里的“拍”是 flashCtrl_ticks() 的调用周期（由 FLASH_CTRL_CYCLE_MS 声明），属于集成参数，
+ *     与应用层自己的节拍没有关系；两个单位混用最容易把时长算错，所以只保留毫秒这一个口径。
  */
 
 #include "userFlashCtrlCfg.h"
-
-#ifndef NULL
-#if defined(__cplusplus)
-#define NULL 0
-#else
-#define NULL ((void*)0)
-#endif
-#endif
 
 #ifndef FLASH_CTRL_MEM_ATTR
 #define FLASH_CTRL_MEM_ATTR
@@ -84,6 +85,7 @@
 #ifndef FLASH_CTRL_CNT_OF_MS
 #define FLASH_CTRL_CNT_OF_MS(ms)  ((uint16_t)(((uint32_t)(ms) + (FLASH_CTRL_CYCLE_MS - 1u)) / FLASH_CTRL_CYCLE_MS))
 #endif
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -128,6 +130,11 @@ typedef struct FlashCtrl {
     uint8_t      inUse;     /* 内存池槽位占用标志，由库内维护，调用方不要改写 */
     struct FlashCtrl* next; /* 多实例工作时链表指针，由库内维护 */
 
+    /* 启停/释放请求：调用方通过 start/stop/deinit 只写这两个单字节（最后一个写入即“提交”），
+     * 由 ticks 读取并执行。单字节写在 8051 上也是原子的，不会读到“半个指针”。 */
+    volatile uint8_t pendingReq;      /* 请求码：0=无，1=启动，2=停止，3=释放 */
+    volatile uint8_t pendingOffState; /* 请求携带的末态参数（flashCtrlOffState_t） */
+
     union {
         /* 简单模式的进度 */
         struct {
@@ -152,34 +159,40 @@ typedef struct FlashCtrl {
 } FlashCtrl;
 
 /* 在库内静态内存池中分配一个句柄，并登记执行器的动作/停止/状态读取函数。
- * 返回 NULL 表示内存池已满（需要调大 FLASH_CTRL_ACTUATOR_NUM）或 get_sts 非法。 */
+ * 返回 0（空指针）表示内存池已满（需要调大 FLASH_CTRL_ACTUATOR_NUM）或 get_sts 非法。 */
 FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_sts_func get_sts);
 
-/* 释放句柄：先按 offState 停止节拍控制（口径与 flashCtrl_stop 完全一致），再清空槽位、
- * 槽位可被后续 flashCtrl_init 复用。offState 传 FLASH_CTRL_STS_KEEP 表示只回收资源、不动执行器。 */
+/* 请求释放（异步）：只登记请求，实际摘链 + 末态处理 + 归还槽位由 flashCtrl_ticks() 在下一拍执行，
+ * 口径与 flashCtrl_stop 完全一致。offState 传 FLASH_CTRL_STS_KEEP 表示只回收资源、不动执行器。
+ * 执行完成后槽位可被后续 flashCtrl_init 复用。 */
 void flashCtrl_deinit(FlashCtrl* handle, flashCtrlOffState_t offState);
 
 /* 查询内存池中已分配的句柄数量 / 内存池容量 */
 uint16_t flashCtrl_getUsedCount(void);
 uint16_t flashCtrl_getCapacity(void);
 
-/* 设置动作态/静止态的时长（简单模式），两者都会清零节拍计数，并让句柄回到简单模式：
- * setThdCnt 按节拍数（0 拍 = 不进入该相位），setThdMs 按毫秒数（库内用 FLASH_CTRL_CYCLE_MS 换算，向上取整）；
- * getThdCnt 读回当前的节拍数（阈值不随模式切换丢失，灯语模式下也可读回切走前设置的值）。 */
-void flashCtrl_setThdCnt(FlashCtrl* handle, uint16_t on_thd, uint16_t off_thd);
+/* 设置动作态/静止态的时长（简单模式），单位毫秒；会清零节拍计数并让句柄回到简单模式。
+ * 库内用 FLASH_CTRL_CYCLE_MS 换算成拍（向上取整，非 0 毫秒至少 1 拍；0 毫秒 = 不进入该相位）。
+ * 单位口径：本库对外只用毫秒；内部“拍”= flashCtrl_ticks() 的调用周期，
+ *   它是集成参数（FLASH_CTRL_CYCLE_MS），与应用层自己的节拍无关。
+ * 精度受拍长限制：实际时长 = 拍数 × FLASH_CTRL_CYCLE_MS（10ms 一拍时给 5ms 实际为 10ms）。 */
 void flashCtrl_setThdMs(FlashCtrl* handle, uint16_t on_ms, uint16_t off_ms);
-void flashCtrl_getThdCnt(FlashCtrl* handle, uint16_t* on_thd, uint16_t* off_thd);
 
 /* 清零当前阶段的进度计数，不改变阈值、模式与执行器状态 */
 void flashCtrl_reset(FlashCtrl* handle);
 
-/* 启停与调度：start 把句柄加入工作链表，ticks 由调用方按固定周期调用 */
+/* 提交“启动”请求（异步）：句柄由 flashCtrl_ticks() 在下一拍挂入工作链表；
+ * ticks 由调用方按固定周期调用（通常放在定时器中断里）。
+ * 返回 0：请求已受理；-1：句柄非法（空指针或已释放）。
+ * 同一拍内对同一句柄多次提交时，以最后一次为准（同字段后写覆盖前写）。 */
 int flashCtrl_start(FlashCtrl* handle);
 
-/* 停止节拍控制：把句柄移出工作链表，并按 offState 指定停止时执行器的末态
+/* 提交“停止”请求（异步）：由 flashCtrl_ticks() 在下一拍摘链并按 offState 处理末态
  * （FLASH_CTRL_STS_KEEP 不改动执行器；ACTIVE/IDLE 会切换状态并清零节拍计数）。 */
 void flashCtrl_stop(FlashCtrl* handle, flashCtrlOffState_t offState);
 
+/* 节拍调度：先执行主循环提交的启动/停止/释放请求（链表只在这里被改动，
+ * 调用方无需再加临界区），再推进所有已挂链句柄的节拍。 */
 void flashCtrl_ticks(void);
 
 #if FLASH_CTRL_LANG_EN
@@ -194,10 +207,9 @@ void flashCtrl_ticks(void);
  *   shortOn: 短亮的点亮时长
  *   gapOff:  每次闪烁之间的熄灭时长（长亮之间、短亮之间、长亮组与短亮组之间共用）
  *   leadOff: 首尾熄灭时长（触发时执行器正亮着就先灭这么久；一轮跑完的收尾熄灭也用它）
- * 传 0 表示该时长 0 拍（该阶段被跳过）。
+ * 传 0 毫秒表示该阶段被跳过。
  * 例：报“2 次长亮 + 2 次短亮”，长亮亮 300ms、短亮亮 100ms、闪烁间熄灭 200ms、首尾各熄 700ms：
  *     flashCtrl_setLangCfgMs(300, 100, 200, 700);  再 flashCtrl_langTrigger(handle, 2, 2, 1); */
-void flashCtrl_setLangCfgCnt(uint16_t longOn, uint16_t shortOn, uint16_t gapOff, uint16_t leadOff);
 void flashCtrl_setLangCfgMs(uint16_t longOnMs, uint16_t shortOnMs, uint16_t gapOffMs, uint16_t leadOffMs);
 
 /* 触发灯语：设置本轮的长亮/短亮次数与需要重复的整轮数，并把轮数、进度清零后从头开始跑。

@@ -27,7 +27,8 @@
 
 /* 调度周期（一拍 = 多少毫秒），取值 1~255
  * 必须与调用 flashCtrl_ticks() 的实际周期一致，例如主循环延时 10ms 调一次，就填 10。
- * 用 flashCtrl_setThdCnt() 直接给节拍数时不依赖该值；用 flashCtrl_setThdMs() 给毫秒数时按该值换算。 */
+ * 库内所有“毫秒 → 拍”的换算都以该值为依据（setThdMs / setLangCfgMs），
+ * 因此它必须与实际调用 flashCtrl_ticks() 的周期严格一致，否则所有时长会成比例偏移。 */
 #define FLASH_CTRL_CYCLE_MS         10
 
 /* 灯语模式开关

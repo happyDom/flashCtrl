@@ -19,7 +19,7 @@
 #define LED0_OFF()  (P42 = 1)                       /* P42 拉高，板载 LED 熄灭 */
 #define LED0_STS()  ((uint8_t)(P42 ? 1 : 0))         /* 0：点亮，1：熄灭 */
 
-static FlashCtrl* led0 = NULL;   /* 库内分配的句柄，外部只记录指针 */
+static FlashCtrl* led0 = 0;      /* 库内分配的句柄，外部只记录指针 */
 
 static void led0_turn_on(void)    { LED0_ON();  }
 static void led0_turn_off(void)   { LED0_OFF(); }
@@ -30,20 +30,20 @@ static uint8_t led0_get_sts(void) { return LED0_STS(); }
 #define BEEP_OFF()  (P10 = 1)
 #define BEEP_STS()  ((uint8_t)(P10 ? 1 : 0))
 
-static FlashCtrl* buzzer = NULL;
+static FlashCtrl* buzzer = 0;
 
 static void buzzer_turn_on(void)    { BEEP_ON();  }
 static void buzzer_turn_off(void)   { BEEP_OFF(); }
 static uint8_t buzzer_get_sts(void) { return BEEP_STS(); }
 
 void main(void){
-    led0 = flashCtrl_init(led0_turn_on, led0_turn_off, led0_get_sts);   // 如果注册不成功，返回 NULL，用户可以自己写 NULL 时的处理逻辑
-    flashCtrl_setThdCnt(led0, 5, 15);   // 亮 5 拍、灭 15 拍；按 10ms 一拍，即亮 50ms、灭 150ms
-    flashCtrl_start(led0);              // 加入工作链表, 最后由 flashCtrl_ticks() 统一调度
+    led0 = flashCtrl_init(led0_turn_on, led0_turn_off, led0_get_sts);   // 注册失败时返回 0（空指针），由调用方自行处理
+    flashCtrl_setThdMs(led0, 50, 150);  // 亮 50ms、灭 150ms（10ms 一拍下即 5 拍 / 15 拍）
+    flashCtrl_start(led0);              // 提交启动请求，由 flashCtrl_ticks() 在下一拍挂链（异步）
 
     buzzer = flashCtrl_init(buzzer_turn_on, buzzer_turn_off, buzzer_get_sts);
     flashCtrl_setThdMs(buzzer, 20, 280);   // 鸣 20ms、停 280ms（10ms 一拍 → 2 拍 / 28 拍）
-    flashCtrl_start(buzzer);
+    flashCtrl_start(buzzer);            // 同上：请求式，下一拍生效
 
     // 配置灯语参数，长亮时间 / 短亮时间 / 闪烁间熄灭时间 / 首尾(两次灯语间间隔）熄灭时间
     flashCtrl_setLangCfgMs(300, 100, 200, 700);

@@ -10,8 +10,8 @@
  *   - 执行器的控制动作（点亮/熄灭、鸣叫/静默）由调用方通过函数指针注册，
  *     具体动作由调用方维护（见 flashCtrl_init 的 turn_on / turn_off）；
  *   - 执行器的当前状态由调用方通过函数指针注册（见 flashCtrl_init 的 get_sts）；
- *   - 控制过程用到的参数由库内维护，通过 flashCtrl_setThdCnt（按节拍数）或
- *     flashCtrl_setThdMs（按毫秒，内部用 FLASH_CTRL_CYCLE_MS 换算）设置，
+ *   - 控制过程用到的参数由库内维护，通过 flashCtrl_setThdMs（按毫秒，
+ *     内部用 FLASH_CTRL_CYCLE_MS 换算成拍）设置，
  *     模式参考 multi_button 的 button_init / button_attach / button_start / button_ticks 用法；
  *   - 句柄由库内静态内存池分配并返回，调用方只记录指针，避免同一句柄
  *     在多处被混用、重复初始化；
@@ -26,7 +26,7 @@
  *      轮数在触发时一次给定，跑满设定轮数后自停（停在熄灭态），调用方查 flashCtrl_isLangDone
  *      后再切换下一个错误码；cycles 传 0 表示无限重复（常驻故障指示）。
  *
- * 模式切换：flashCtrl_langTrigger 切到灯语模式，flashCtrl_exitLangMode（或 setThdCnt/setThdMs）
+ * 模式切换：flashCtrl_langTrigger 切到灯语模式，flashCtrl_exitLangMode（或 setThdMs）
  * 切回简单模式；简单模式的阈值存放在联合体外面，所以来回切换时阈值不会丢。
  */
 
@@ -67,6 +67,26 @@ typedef union {
 static FlashCtrlPool_t FLASH_CTRL_MEM_ATTR flashPool;   /* 静态内存池 */
 static FlashCtrl* head_handle;                          /* 调度链表头 */
 
+/* ---- 空对象：句柄内永远存放“可调用”的函数 ----------------------------------------------
+ * 函数指针与通用指针宽度不保证一致（C251 上 code 指针 2 字节、通用空指针 3 字节），
+ * 直接把通用空指针赋给函数指针会截断并触发 C151 告警。改用“空实现”兜底后：
+ *   1) 句柄里不存在空函数指针，ticks 内部不必逐拍判空；
+ *   2) 调用方依旧可以传 0（空指针，见 flashCtrl_init），由 init 统一替换为空实现。 */
+static void    flashCtrl_noOp(void)    { }                /* 空动作：什么也不做 */
+static uint8_t flashCtrl_stsIdle(void) { return 1; }      /* 空查询：视为静止态 */
+
+/* ---- 请求码：调用方只写两个单字节，链表操作一律在 ticks 上下文里完成 ---- */
+#define FLASH_REQ_NONE      0u
+#define FLASH_REQ_START     1u
+#define FLASH_REQ_STOP      2u
+#define FLASH_REQ_DEINIT    3u
+
+static void clearProgress(FlashCtrl* handle);
+static void doStart(FlashCtrl* handle);
+static void doStop(FlashCtrl* handle, flashCtrlOffState_t offState);
+static void doDeinit(FlashCtrl* handle, flashCtrlOffState_t offState);
+static void serviceRequests(void);
+
 /* 取池中第 idx 个槽位的地址 */
 static FlashCtrl* slotPtr(uint16_t idx) {
     return (FlashCtrl*)(void*)&flashPool.bytes[(uint16_t)(idx * FLASH_CTRL_SLOT_SIZE)];
@@ -74,27 +94,34 @@ static FlashCtrl* slotPtr(uint16_t idx) {
 
 /**
   * @brief  在静态内存池中分配一个闪烁控制句柄，并登记执行器函数。
-  * @param  turn_on:  进入动作态的函数（如拉低端口点亮 LED），可传 NULL
-  * @param  turn_off: 进入静止态的函数（如拉高端口熄灭 LED），可传 NULL
-  * @param  get_sts:  读取当前状态的函数，返回 0：动作态，1：静止态，不可传 NULL
-  * @retval 分配到的句柄；NULL：内存池已满（需调大 FLASH_CTRL_ACTUATOR_NUM）或参数非法
+  * @param  turn_on:  进入动作态的函数（如拉低端口点亮 LED），可传 0（空指针）
+  * @param  turn_off: 进入静止态的函数（如拉高端口熄灭 LED），可传 0（空指针）
+  * @param  get_sts:  读取当前状态的函数，返回 0：动作态，1：静止态，不可传 0
+  * @retval 分配到的句柄；0：内存池已满（需调大 FLASH_CTRL_ACTUATOR_NUM）或参数非法
   */
 FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_sts_func get_sts) {
     uint16_t i;
     FlashCtrl* handle;
 
-    if(NULL == get_sts) return NULL;   // 状态读取函数是必须的
+    if(!get_sts) return 0;   // 状态读取函数是必须的
 
     for(i = 0; i < (uint16_t)FLASH_CTRL_ACTUATOR_NUM; i++){
         handle = slotPtr(i);
         if(0 == handle->inUse){
             // 显式逐项初始化，不依赖 memset
-            handle->turn_on  = turn_on;
-            handle->turn_off = turn_off;
-            handle->get_sts  = get_sts;
+            /* 空函数指针一律用“空实现”兜底：调用方可以传空指针，句柄内不会留下空指针。
+               注意：这里不要写成 (void*)0 —— C251 上通用指针 3 字节、code 指针 2 字节，
+               跨类型赋值会截断并触发 C151 告警；三目判断 / 裸 0 都不会告警。 */
+            handle->turn_on  = turn_on  ? turn_on  : flashCtrl_noOp;
+            handle->turn_off = turn_off ? turn_off : flashCtrl_noOp;
+            handle->get_sts  = get_sts;      /* 入口已判空，必为有效函数 */
             handle->mode     = FLASH_CTRL_MODE_SIMPLE;
-            handle->inUse    = 1;
-            handle->next     = NULL;
+            handle->next     = 0;
+
+            handle->pendingReq      = FLASH_REQ_NONE;        /* 新槽位无挂起请求 */
+            handle->pendingOffState = FLASH_CTRL_STS_KEEP;
+
+            handle->inUse    = 1;    /* 最后置占用标志：此前 ticks 不会把它当成已分配槽位 */
 
             handle->on_thd  = 0;
             handle->off_thd = 0;
@@ -115,7 +142,7 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_sts_fu
         }
     }
 
-    return NULL;   // 池满
+    return 0;   // 池满
 }
 
 /**
@@ -126,16 +153,51 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_sts_fu
   * @retval None
   */
 void flashCtrl_deinit(FlashCtrl* handle, flashCtrlOffState_t offState) {
-    if(NULL == handle || 0 == handle->inUse) return;
+    if(0 == handle || 0 == handle->inUse) return;   // 入口判空：调用方可能传空指针或已释放的句柄
 
-    flashCtrl_stop(handle, offState);   // 先摘链（并按调用方要求处理执行器末态）
+    /* 只登记请求：两个单字节写入，不碰链表，也不会让 ISR 读到“半个指针” */
+    handle->pendingOffState = (uint8_t)offState;
+    handle->pendingReq      = FLASH_REQ_DEINIT;
+}
 
-    handle->turn_on  = NULL;
-    handle->turn_off = NULL;
-    handle->get_sts  = NULL;
+/* 实际的释放动作：只在 flashCtrl_ticks() -> serviceRequests() 里执行 */
+static void doDeinit(FlashCtrl* handle, flashCtrlOffState_t offState) {
+    FlashCtrl** curr;
+
+    /* 摘链 */
+    for(curr = &head_handle; *curr; ){
+        if(*curr == handle){
+            *curr        = (*curr)->next;
+            handle->next = 0;
+            break;
+        } else {
+            curr = &(*curr)->next;
+        }
+    }
+
+    /* 按调用方要求处理执行器末态；turn_on/turn_off 由 init/deinit 保证是“可调用”的，无需判空 */
+    switch(offState){
+    case FLASH_CTRL_STS_ACTIVE:
+        handle->turn_on();
+        clearProgress(handle);
+        break;
+
+    case FLASH_CTRL_STS_IDLE:
+        handle->turn_off();
+        clearProgress(handle);
+        break;
+
+    case FLASH_CTRL_STS_KEEP:
+    default:
+        break;
+    }
+
+    /* 归还槽位：函数指针回到“空实现”而不是通用空指针（避免指针宽度不同导致截断） */
+    handle->turn_on  = flashCtrl_noOp;
+    handle->turn_off = flashCtrl_noOp;
+    handle->get_sts  = flashCtrl_stsIdle;
     handle->mode     = FLASH_CTRL_MODE_SIMPLE;
-    handle->next     = NULL;
-    handle->inUse    = 0;     // 槽位归还内存池
+    handle->next     = 0;
 
     handle->on_thd  = 0;
     handle->off_thd = 0;
@@ -152,6 +214,9 @@ void flashCtrl_deinit(FlashCtrl* handle, flashCtrlOffState_t offState) {
     handle->u.lang.phase      = LANG_PH_IDLE;
     handle->u.lang.lit        = 1;
 #endif
+
+    handle->pendingReq = FLASH_REQ_NONE;   /* 先清挂起请求，再归还槽位 */
+    handle->inUse      = 0;                /* 最后归还槽位，此后 init 可复用 */
 }
 
 /**
@@ -179,22 +244,7 @@ uint16_t flashCtrl_getCapacity(void) {
     return (uint16_t)FLASH_CTRL_ACTUATOR_NUM;
 }
 
-/**
-  * @brief  按节拍数设置动作态/静止态的时长（简单模式），同时清零节拍计数。
-  * @param  handle: 闪烁控制句柄
-  * @param  on_thd: 动作态节拍数，0：不动作（保持静止）
-  * @param  off_thd:静止态节拍数，0：不停止（保持动作）
-  * @retval None
-  */
-void flashCtrl_setThdCnt(FlashCtrl* handle, uint16_t on_thd, uint16_t off_thd) {
-    if(NULL == handle) return;
 
-    handle->mode = FLASH_CTRL_MODE_SIMPLE;
-    handle->on_thd  = on_thd;
-    handle->off_thd = off_thd;
-    handle->u.simple.on_cnt  = 0;
-    handle->u.simple.off_cnt = 0;
-}
 
 /**
   * @brief  按毫秒设置动作态/静止态时长（简单模式），库内用 FLASH_CTRL_CYCLE_MS 换算成节拍数。
@@ -205,7 +255,7 @@ void flashCtrl_setThdCnt(FlashCtrl* handle, uint16_t on_thd, uint16_t off_thd) {
   * @retval None
   */
 void flashCtrl_setThdMs(FlashCtrl* handle, uint16_t on_ms, uint16_t off_ms) {
-    if(NULL == handle) return;
+    if(0 == handle) return;
 
     handle->mode = FLASH_CTRL_MODE_SIMPLE;
     handle->on_thd  = FLASH_CTRL_CNT_OF_MS(on_ms);
@@ -214,19 +264,7 @@ void flashCtrl_setThdMs(FlashCtrl* handle, uint16_t on_ms, uint16_t off_ms) {
     handle->u.simple.off_cnt = 0;
 }
 
-/**
-  * @brief  读取当前设置的节拍数（阈值不随模式切换丢失，灯语模式下也可读回切走前的值）。
-  * @param  handle: 闪烁控制句柄
-  * @param  on_thd: 输出动作态节拍数，可为 NULL
-  * @param  off_thd:输出静止态节拍数，可为 NULL
-  * @retval None
-  */
-void flashCtrl_getThdCnt(FlashCtrl* handle, uint16_t* on_thd, uint16_t* off_thd) {
-    if(NULL == handle) return;
 
-    if(NULL != on_thd)  *on_thd  = handle->on_thd;
-    if(NULL != off_thd) *off_thd = handle->off_thd;
-}
 
 /**
   * @brief  清零当前模式的阶段进度（库内私有）：简单模式清节拍计数，灯语模式清阶段计时。
@@ -251,7 +289,7 @@ static void clearProgress(FlashCtrl* handle) {
   * @retval None
   */
 void flashCtrl_reset(FlashCtrl* handle) {
-    if(NULL == handle) return;
+    if(0 == handle) return;
 
     clearProgress(handle);
 }
@@ -266,8 +304,6 @@ static void flashCtrl_toggle(FlashCtrl* handle) {
     uint16_t on_thd  = handle->on_thd;
     uint16_t off_thd = handle->off_thd;
 
-    if(NULL == handle->get_sts) return;
-
     sts = handle->get_sts();   // 获取执行器当前状态（0：动作态，1：静止态）
 
     if(on_thd == 0 && off_thd == 0){
@@ -281,7 +317,7 @@ static void flashCtrl_toggle(FlashCtrl* handle) {
         if(on_thd == 0){   // 动作阈值为0，则保持静止状态，不进入动作态
             FLASH_CNT_INC(handle->u.simple.off_cnt);
         } else if(handle->u.simple.off_cnt >= off_thd){
-            if(NULL != handle->turn_on) handle->turn_on();   // 静止节拍已到，进入动作态
+            handle->turn_on();   // 静止节拍已到，进入动作态
 
             handle->u.simple.off_cnt = 0;
             handle->u.simple.on_cnt  = 0;
@@ -292,7 +328,7 @@ static void flashCtrl_toggle(FlashCtrl* handle) {
         if(off_thd == 0){   // 停止阈值为0，则保持动作状态，不进入静止态
             FLASH_CNT_INC(handle->u.simple.on_cnt);
         } else if(handle->u.simple.on_cnt >= on_thd){
-            if(NULL != handle->turn_off) handle->turn_off();   // 动作节拍已到，进入静止态
+            handle->turn_off();   // 动作节拍已到，进入静止态
 
             handle->u.simple.off_cnt = 0;
             handle->u.simple.on_cnt  = 0;
@@ -313,9 +349,9 @@ static void langDrive(FlashCtrl* handle, uint8_t lit) {
     if(handle->u.lang.lit == lit) return;   // 避免每拍重复写端口
 
     if(0 == lit){
-        if(NULL != handle->turn_on)  handle->turn_on();
+        handle->turn_on();
     } else {
-        if(NULL != handle->turn_off) handle->turn_off();
+        handle->turn_off();
     }
 
     handle->u.lang.lit = lit;
@@ -468,20 +504,7 @@ static void flashCtrl_toggleLang(FlashCtrl* handle) {
     }
 }
 
-/**
-  * @brief  配置灯语的各段时长（全局，所有句柄共用），单位：节拍数。
-  * @param  longOn:  长亮的点亮时长
-  * @param  shortOn: 短亮的点亮时长
-  * @param  gapOff:  闪烁之间的熄灭时长（长亮之间、短亮之间、两组之间共用）
-  * @param  leadOff: 首尾熄灭时长（起始熄灭与收尾熄灭共用）
-  * @retval None
-  */
-void flashCtrl_setLangCfgCnt(uint16_t longOn, uint16_t shortOn, uint16_t gapOff, uint16_t leadOff) {
-    gLangLongOn  = longOn;
-    gLangShortOn = shortOn;
-    gLangGapOff  = gapOff;
-    gLangLeadOff = leadOff;
-}
+
 
 /**
   * @brief  配置灯语的各段时长（全局，所有句柄共用），单位：毫秒。
@@ -507,7 +530,7 @@ void flashCtrl_setLangCfgMs(uint16_t longOnMs, uint16_t shortOnMs, uint16_t gapO
   * @retval None
   */
 void flashCtrl_langTrigger(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOfShort, uint8_t cycles) {
-    if(NULL == handle || 0 == handle->inUse) return;
+    if(0 == handle || 0 == handle->inUse) return;
 
     handle->mode = FLASH_CTRL_MODE_LANG;
 
@@ -518,7 +541,7 @@ void flashCtrl_langTrigger(FlashCtrl* handle, uint8_t timesOfLong, uint8_t times
     handle->u.lang.shortDone  = 0;
     handle->u.lang.cycleCnt   = 0;
     handle->u.lang.phaseCnt   = 0;
-    handle->u.lang.lit        = (NULL != handle->get_sts) ? handle->get_sts() : 1;
+    handle->u.lang.lit        = handle->get_sts();   /* 状态读取函数由 init 保证有效（空实现返回 1） */
 
     if(0 == timesOfLong && 0 == timesOfShort){
         handle->u.lang.phase = LANG_PH_IDLE;   // 取消灯语，不动执行器
@@ -539,7 +562,7 @@ void flashCtrl_langTrigger(FlashCtrl* handle, uint8_t timesOfLong, uint8_t times
   * @retval None
   */
 void flashCtrl_exitLangMode(FlashCtrl* handle) {
-    if(NULL == handle || 0 == handle->inUse) return;
+    if(0 == handle || 0 == handle->inUse) return;
 
     handle->mode = FLASH_CTRL_MODE_SIMPLE;
 
@@ -564,7 +587,7 @@ void flashCtrl_exitLangMode(FlashCtrl* handle) {
   *         0：还在跑，或 cycles 传了 0（无限重复），或当前不在灯语模式
   */
 uint8_t flashCtrl_isLangDone(FlashCtrl* handle) {
-    if(NULL == handle || FLASH_CTRL_MODE_LANG != handle->mode) return 0;
+    if(0 == handle || FLASH_CTRL_MODE_LANG != handle->mode) return 0;
     if(0 == handle->u.lang.cycles) return 0;   // 无限重复，不存在“跑完”
 
     return (handle->u.lang.cycleCnt >= handle->u.lang.cycles) ? 1 : 0;
@@ -576,7 +599,7 @@ uint8_t flashCtrl_isLangDone(FlashCtrl* handle) {
   * @retval 已完成的整轮数（65535 封顶）；非灯语模式返回 0
   */
 uint16_t flashCtrl_getLangCycle(FlashCtrl* handle) {
-    if(NULL == handle || FLASH_CTRL_MODE_LANG != handle->mode) return 0;
+    if(0 == handle || FLASH_CTRL_MODE_LANG != handle->mode) return 0;
 
     return handle->u.lang.cycleCnt;
 }
@@ -587,7 +610,7 @@ uint16_t flashCtrl_getLangCycle(FlashCtrl* handle) {
   * @retval None
   */
 void flashCtrl_resetLangCycle(FlashCtrl* handle) {
-    if(NULL == handle || FLASH_CTRL_MODE_LANG != handle->mode) return;
+    if(0 == handle || FLASH_CTRL_MODE_LANG != handle->mode) return;
 
     handle->u.lang.cycleCnt = 0;
 }
@@ -599,19 +622,22 @@ void flashCtrl_resetLangCycle(FlashCtrl* handle) {
   * @retval 0：成功；-1：句柄非法或已在链表中
   */
 int flashCtrl_start(FlashCtrl* handle) {
+    if(0 == handle || 0 == handle->inUse) return -1;   // 入口判空：调用方可能传空指针或已释放的句柄
+
+    handle->pendingReq = FLASH_REQ_START;   // 单字节写即“提交”，由 ticks 下一拍挂链
+    return 0;
+}
+
+/* 实际的挂链动作：只在 flashCtrl_ticks() -> serviceRequests() 里执行 */
+static void doStart(FlashCtrl* handle) {
     FlashCtrl* target;
 
-    if(NULL == handle || 0 == handle->inUse) return -1;
-
-    target = head_handle;
-    while(target){
-        if(target == handle) return -1;   // 已存在
-        target = target->next;
+    for(target = head_handle; target; target = target->next){
+        if(target == handle) return;   // 已在链表中：重复请求忽略
     }
 
     handle->next = head_handle;
     head_handle  = handle;
-    return 0;
 }
 
 /**
@@ -624,37 +650,40 @@ int flashCtrl_start(FlashCtrl* handle) {
   * @retval None
   */
 void flashCtrl_stop(FlashCtrl* handle, flashCtrlOffState_t offState) {
+    if(0 == handle || 0 == handle->inUse) return;   // 入口判空：调用方可能传空指针或已释放的句柄
+
+    handle->pendingOffState = (uint8_t)offState;
+    handle->pendingReq      = FLASH_REQ_STOP;
+}
+
+/* 实际的摘链 + 末态处理：只在 flashCtrl_ticks() -> serviceRequests() 里执行 */
+static void doStop(FlashCtrl* handle, flashCtrlOffState_t offState) {
     FlashCtrl** curr;
 
-    if(NULL == handle) return;
-
-    /* 先摘链，保证停止后 ticks 不再推进本句柄 */
     for(curr = &head_handle; *curr; ){
-        FlashCtrl* entry = *curr;
-        if(entry == handle){
-            *curr = entry->next;
-            entry->next = NULL;
+        if(*curr == handle){
+            *curr        = (*curr)->next;
+            handle->next = 0;
             break;
         } else {
-            curr = &entry->next;
+            curr = &(*curr)->next;
         }
     }
 
-    /* 再按调用方的要求决定停止时执行器的末态 */
     switch(offState){
     case FLASH_CTRL_STS_ACTIVE:
-        if(NULL != handle->turn_on) handle->turn_on();
+        handle->turn_on();
         clearProgress(handle);
         break;
 
     case FLASH_CTRL_STS_IDLE:
-        if(NULL != handle->turn_off) handle->turn_off();
+        handle->turn_off();
         clearProgress(handle);
         break;
 
     case FLASH_CTRL_STS_KEEP:
     default:
-        break;   // 保持当前状态，不动执行器
+        break;
     }
 }
 
@@ -667,6 +696,12 @@ void flashCtrl_stop(FlashCtrl* handle, flashCtrlOffState_t offState) {
 void flashCtrl_ticks(void) {
     FlashCtrl* target;
 
+    /* 1) 先把主循环提交的启动/停止/释放请求执行掉：
+       链表只在这里被改动，因此调用方不必自己做临界区，也不存在
+       “ticks 正在遍历、主循环同时摘链”的竞争 */
+    serviceRequests();
+
+    /* 2) 再推进所有已挂链句柄的节拍 */
     for(target = head_handle; target; target = target->next){
 #if FLASH_CTRL_LANG_EN
         if(FLASH_CTRL_MODE_LANG == target->mode){
@@ -676,5 +711,36 @@ void flashCtrl_ticks(void) {
         {
             flashCtrl_toggle(target);
         }
+    }
+}
+
+/* 请求处理：逐槽位读取 pendingReq（单字节读，不会读到“半个指针”）。
+ * 因链表操作全部收在本函数里，本函数与调用方必须同上下文（即 ticks 所在的中断/主循环），
+ * 与调用方提交请求的上下文可以不同。 */
+static void serviceRequests(void) {
+    uint16_t i;
+    FlashCtrl* h;
+    uint8_t req, off;
+
+    for(i = 0; i < (uint16_t)FLASH_CTRL_ACTUATOR_NUM; i++){
+        h   = slotPtr(i);
+        req = h->pendingReq;
+        if(FLASH_REQ_NONE == req) continue;
+
+        if(0 == h->inUse){                     /* 槽位已释放：丢弃残留请求 */
+            h->pendingReq = FLASH_REQ_NONE;
+            continue;
+        }
+
+        off = h->pendingOffState;
+        switch(req){
+        case FLASH_REQ_START:  doStart(h);                                break;
+        case FLASH_REQ_STOP:   doStop(h, (flashCtrlOffState_t)off);       break;
+        case FLASH_REQ_DEINIT: doDeinit(h, (flashCtrlOffState_t)off);     break;
+        default:                                                          break;
+        }
+
+        /* 执行期间若又提交了新请求（值不同）则保留到下一拍；值相同视为本次已处理 */
+        if((uint8_t)req == h->pendingReq) h->pendingReq = FLASH_REQ_NONE;
     }
 }

@@ -35,7 +35,7 @@ example/
 - 无动态内存：句柄由库内静态内存池分配，池大小 = `FLASH_CTRL_ACTUATOR_NUM * sizeof(FlashCtrl)`；
 - 无库函数依赖：只引用 `stdint.h`，不使用 `string.h` / `memset`，初始化逐项赋值；
 - 用户配置隔离：执行器数量与调度周期写在项目自己的 `userFlashCtrlCfg.h` 中，换项目只增删项目侧这个文件，不触碰本库任何文件；
-- 双单位设置：可按键拍数（`flashCtrl_setThdCnt`）或毫秒数（`flashCtrl_setThdMs`）指定明暗时长；
+- 单位唯一：时长一律按毫秒设置（`flashCtrl_setThdMs` / `setLangCfgMs`），库内按 `FLASH_CTRL_CYCLE_MS` 换算成拍，不对外暴露“节拍数”接口（避免与应用层节拍混淆）；
 - C51 友好：可通过 `FLASH_CTRL_MEM_ATTR` 把内存池指定到 `xdata` 等存储区。
 
 > 本库的文件（含 `cfg/` 下的参考样例）请保持原样，仅作引用。项目相关的配置与改动一律留在项目侧，
@@ -52,7 +52,7 @@ example/
 /* #define FLASH_CTRL_MEM_ATTR      xdata */  /* 可选，C51 上指定内存池存放区 */
 ```
 
-`FLASH_CTRL_CYCLE_MS` 只影响 `flashCtrl_setThdMs`（毫秒）的换算，用 `flashCtrl_setThdCnt`（节拍数）时不会用到；
+`FLASH_CTRL_CYCLE_MS` 是所有“毫秒 → 拍”换算的唯一依据（`setThdMs` / `setLangCfgMs`），必须与实际调用 `flashCtrl_ticks()` 的周期严格一致；
 两个宏缺一个都会在编译期报错并提示。
 建议开发初期给一个够用的值，项目定形后用 `flashCtrl_getUsedCount()` 读出实际用量再调小。
 
@@ -80,9 +80,7 @@ example/
 | `flashCtrl_deinit(handle, offState)` | 先按 `offState` 停止节拍控制（口径与 `flashCtrl_stop` 相同），再清空槽位、归还内存池，槽位可被后续 `init` 复用；`KEEP` 表示只回收资源、不动执行器 |
 | `flashCtrl_getUsedCount()` | 查询已分配的句柄数量 |
 | `flashCtrl_getCapacity()` | 查询内存池容量（即 `FLASH_CTRL_ACTUATOR_NUM`） |
-| `flashCtrl_setThdCnt(handle, on_thd, off_thd)` | 按节拍数设置动作态 / 静止态时长，同时清零节拍计数 |
 | `flashCtrl_setThdMs(handle, on_ms, off_ms)` | 按毫秒数设置动作态 / 静止态时长，库内用 `FLASH_CTRL_CYCLE_MS` 换算成节拍数（向上取整，0 毫秒仍为 0 拍） |
-| `flashCtrl_getThdCnt(handle, &on_thd, &off_thd)` | 读取当前节拍数（参数可传 `NULL`）；阈值不随模式切换丢失，灯语模式下也能读回切走前的值 |
 | `flashCtrl_reset(handle)` | 清零当前阶段进度：简单模式清节拍计数，灯语模式清阶段计时；不改变阈值、模式与执行器状态 |
 | `flashCtrl_start(handle)` | 把句柄加入工作链表，重复加入返回 -1 |
 | `flashCtrl_stop(handle, offState)` | 把句柄移出工作链表，并按 `offState` 指定停止时的执行器末态：`KEEP` 不动硬件、`ACTIVE` 停在动作态、`IDLE` 停在静止态（后两者会切换状态并清零节拍计数） |
@@ -95,7 +93,7 @@ example/
 一个句柄同一时刻只处于一种模式：
 - 切到灯语模式：`flashCtrl_langTrigger(handle, ...)`；
 - 退出灯语模式：`flashCtrl_exitLangMode(handle)`（阈值沿用切走前的值，无需重设），
-  或者直接调 `flashCtrl_setThdCnt` / `flashCtrl_setThdMs`（等于“切回简单模式并重设时长”）。
+  或者直接调 `flashCtrl_setThdMs`（等于“切回简单模式并重设时长”）。
 
 两种模式的进度共用同一块句柄内存（联合体），而简单模式的阈值放在联合体外面，
 所以来回切换时阈值不会丢，句柄也不会因为多了一种模式而明显变大。
@@ -112,7 +110,6 @@ example/
 
 | 方法 | 说明 |
 | --- | --- |
-| `flashCtrl_setLangCfgCnt(longOn, shortOn, gapOff, leadOff)` | 按节拍数配置灯语各段时长 |
 | `flashCtrl_setLangCfgMs(longOnMs, shortOnMs, gapOffMs, leadOffMs)` | 同上，但按毫秒数给，库内用 `FLASH_CTRL_CYCLE_MS` 换算成节拍数 |
 | `flashCtrl_langTrigger(handle, timesOfLong, timesOfShort, cycles)` | 触发灯语：指定长亮 / 短亮次数和要跑的整轮数；跑满 `cycles` 轮后**自停**（停在熄灭态）。两个次数都传 0 表示取消（回空闲、不动执行器）；`cycles` 传 0 表示无限重复 |
 | `flashCtrl_isLangDone(handle)` | 是否已跑完设定轮数：1 已跑完、0 还在跑（`cycles = 0` 或不在灯语模式时恒为 0） |
@@ -201,7 +198,7 @@ flashCtrl_setLangCfgMs(500, 150, 300, 1200);   /* 长亮亮 500ms、短亮亮 15
 - 两者均为 0：仅累计动作 / 静止节拍数，不改变执行器状态；
 - 两者均非 0：静止 `off_thd` 拍后动作、动作 `on_thd` 拍后停止，循环闪烁。
 
-用 `flashCtrl_setThdMs` 时，上面各处的“节拍数”按 `FLASH_CTRL_CYCLE_MS` 换算：
+上面各处的时长都用毫秒给，库内按 `FLASH_CTRL_CYCLE_MS` 换算成拍：
 `节拍数 = (毫秒数 + 周期 - 1) / 周期`（向上取整）。例如周期 10ms，设 50ms/150ms → 5 拍/15 拍。
 
 ### 典型用法
@@ -216,8 +213,7 @@ static uint8_t led0_get_sts(void) { return P42 ? 1 : 0; }   /* 0：点亮，1：
 led0 = flashCtrl_init(led0_turn_on, led0_turn_off, led0_get_sts);
 if (NULL == led0) { /* 池满：调大 FLASH_CTRL_ACTUATOR_NUM */ }
 
-flashCtrl_setThdCnt(led0, 5, 15);       /* 按键拍数：亮 5 拍、灭 15 拍 */
-/* 或按键毫秒数：flashCtrl_setThdMs(led0, 50, 150); */
+flashCtrl_setThdMs(led0, 50, 150);       /* 亮 50ms、灭 150ms（10ms 一拍下即 5 拍 / 15 拍） */
 
 flashCtrl_start(led0);               /* 加入调度链表 */
 
