@@ -69,7 +69,7 @@ example/
 | --- | --- |
 | `io_ctrl_func` | `void (*)(void)`，执行器控制动作（进入动作态 / 进入静止态） |
 | `io_is_on_func` | `uint8_t (*)(void)`，读取执行器**是否处于动作态**；返回 1 表示动作态（点亮 / 鸣叫），返回 0 表示静止态（熄灭 / 静默）。语义与命名同向，可以直接注册 `isTurnOn()` 这类函数；低电平点亮的 LED 写成 `return (P42 ? 0 : 1);` |
-| `flashCtrlOffState_t` | `flashCtrl_stop` / `flashCtrl_deinit` 的末态参数：`FLASH_CTRL_STS_KEEP` 保持原状、`FLASH_CTRL_STS_ACTIVE` 停在动作态、`FLASH_CTRL_STS_IDLE` 停在静止态（与 `is_on` 返回值含义无关，避免混淆） |
+| `flashCtrlState_t` | 执行器的目标状态，两处用到：`flashCtrl_stop` / `flashCtrl_deinit` 的末态参数、`flashCtrl_setThdMs` 的“闪满后终态”。`FLASH_CTRL_STS_KEEP` 保持原状、`FLASH_CTRL_STS_ON` 停在动作态、`FLASH_CTRL_STS_OFF` 停在静止态（与 `is_on` 返回值含义无关，避免混淆） |
 | `FlashCtrl` | 控制句柄，一个句柄对应一个执行器；由库内内存池分配，阈值与计数由库内维护 |
 
 ### 方法
@@ -80,12 +80,14 @@ example/
 | `flashCtrl_deinit(handle, offState)` | 先按 `offState` 停止节拍控制（口径与 `flashCtrl_stop` 相同），再清空槽位、归还内存池，槽位可被后续 `init` 复用；`KEEP` 表示只回收资源、不动执行器 |
 | `flashCtrl_getUsedCount()` | 查询已分配的句柄数量 |
 | `flashCtrl_getCapacity()` | 查询内存池容量（即 `FLASH_CTRL_ACTUATOR_NUM`） |
-| `flashCtrl_setThdMs(handle, on_ms, off_ms)` | 按毫秒数设置动作态 / 静止态时长，库内用 `FLASH_CTRL_CYCLE_MS` 换算成节拍数（向上取整，0 毫秒仍为 0 拍） |
-| `flashCtrl_reset(handle)` | 清零当前阶段进度：简单模式清节拍计数，灯语模式清阶段计时；不改变阈值、模式与执行器状态 |
+| `flashCtrl_setThdMs(handle, on_ms, off_ms, cycles, endState)` | 按毫秒数设置动作态 / 静止态时长，库内用 `FLASH_CTRL_CYCLE_MS` 换算成节拍数（向上取整，0 毫秒仍为 0 拍）；`cycles` 为需要的闪烁次数（0 = 一直闪下去），`endState` 为闪满后的终态（`KEEP` / `ON` / `OFF`） |
+| `flashCtrl_isFlashDone(handle)` | 简单模式是否已闪满 `cycles` 次（闪满后停在 `endState` 指定的终态、不再推进）；`cycles=0` 或非简单模式恒返回 0 |
+| `flashCtrl_getFlashCnt(handle)` | 查询简单模式已完成的闪烁次数 |
+| `flashCtrl_reset(handle)` | 清零当前阶段进度：简单模式清节拍计数与次数进度（含“已闪满”标志，可让同一套参数再跑一遍），灯语模式清阶段计时；不改变阈值、模式与执行器状态 |
 | `flashCtrl_start(handle)` | 把句柄加入工作链表，重复加入返回 -1 |
-| `flashCtrl_stop(handle, offState)` | 把句柄移出工作链表，并按 `offState` 指定停止时的执行器末态：`KEEP` 不动硬件、`ACTIVE` 停在动作态、`IDLE` 停在静止态（后两者会切换状态并清零节拍计数） |
-| `flashCtrl_turnOn(handle)` | 把执行器固定为**常亮**（动作态）：语义糖，等价 `flashCtrl_setThdMs(handle, 1, 0)`——`off_thd=0` 表示“不熄灭”，故点亮后一直保持；句柄仍留在节拍链表里 |
-| `flashCtrl_turnOff(handle)` | 把执行器固定为**常灭**（静止态）：语义糖，等价 `flashCtrl_setThdMs(handle, 0, 1)`——`on_thd=0` 表示“不点亮”，故熄灭后一直保持 |
+| `flashCtrl_stop(handle, offState)` | 把句柄移出工作链表，并按 `offState` 指定停止时的执行器末态：`KEEP` 不动硬件、`ON` 停在动作态、`OFF` 停在静止态（后两者会切换状态并清零节拍计数） |
+| `flashCtrl_turnOn(handle)` | 把执行器固定为**常亮**（动作态）：语义糖，等价 `flashCtrl_setThdMs(handle, 1, 0, 0, KEEP)`——`off_thd=0` 表示“不熄灭”，故点亮后一直保持；句柄仍留在节拍链表里 |
+| `flashCtrl_turnOff(handle)` | 把执行器固定为**常灭**（静止态）：语义糖，等价 `flashCtrl_setThdMs(handle, 0, 1, 0, KEEP)`——`on_thd=0` 表示“不点亮”，故熄灭后一直保持 |
 | `flashCtrl_ticks()` | 节拍调度，按固定周期调用即可推进所有已启动的句柄 |
 
 > 单个句柄的节拍处理（即通用化后的 `led0_toggle()`）是库内私有函数，由 `flashCtrl_ticks` 内部调用，不对外暴露。
@@ -97,8 +99,8 @@ example/
 - 退出灯语模式：`flashCtrl_exitLangMode(handle)`（阈值沿用切走前的值，无需重设），
   或者直接调 `flashCtrl_setThdMs`（等于“切回简单模式并重设时长”）。
 
-两种模式的进度共用同一块句柄内存（联合体），而简单模式的阈值放在联合体外面，
-所以来回切换时阈值不会丢，句柄也不会因为多了一种模式而明显变大。
+两种模式的进度共用同一块句柄内存（联合体），而简单模式的阈值、次数与终态都放在联合体外面，
+所以来回切换时这几个参数不会丢，句柄也不会因为多了一种模式而明显变大。
 
 灯的时序由**全局**配置一次，所有句柄共用；触发时给“长/短次数 + 要跑几轮”。
 各段“熄灭”时长是共用的，因此配置只需四个时长：
@@ -187,7 +189,7 @@ flashCtrl_setLangCfgMs(500, 150, 300, 1200);   /* 长亮亮 500ms、短亮亮 15
 - **长亮次数少、短亮次数多**更容易辨：长亮代表“大类”，短亮代表“具体项”，看长亮次数一眼就知道是哪一类；
 - 同一时刻只报一个错误码：`startLang(h, 长, 短, 轮数)` 一次给定轮数，跑满自停后再切下一个；
 - 切换的判据是 `flashCtrl_isLangDone(h)`（不是“已经跑到第几轮”），这样应用层轮询慢也不会有半途切换；
-- 致命故障（需要断电复位）建议不用灯语，直接用简单模式高频闪烁：`flashCtrl_setThdMs(h, 50, 50)`；
+- 致命故障（需要断电复位）建议不用灯语，直接用简单模式高频闪烁：`flashCtrl_setThdMs(h, 50, 50, 0, FLASH_CTRL_STS_KEEP)`；
 - “一直报到故障消失”这类常驻指示，用 `cycles = 0`（无限重复），故障消失时 `startLang(h, 0, 0, 0)` 取消；
 - 若觉得“只亮一下就过去了”，通常是 `gapOff` / `leadOff` 配得太大，先缩这两个值，再调亮时长。
 
@@ -199,6 +201,13 @@ flashCtrl_setLangCfgMs(500, 150, 300, 1200);   /* 长亮亮 500ms、短亮亮 15
 - `off_thd = 0`：不进入静止态（当前点亮则保持点亮）；
 - 两者均为 0：仅累计动作 / 静止节拍数，不改变执行器状态；
 - 两者均非 0：静止 `off_thd` 拍后动作、动作 `on_thd` 拍后停止，循环闪烁。
+
+次数与终态（`cycles` / `endState`）：
+
+- 一次闪烁 = 静止段 → 动作段 → 回到静止段 的完整一圈，在动作段结束、切回静止的那一拍计数 +1；
+- 因此 `on_thd = 0` 或 `off_thd = 0` 时永远凑不齐整圈，`cycles` 实际不起作用（常亮 / 常灭请直接传 0）；
+- `cycles = 0`：一直闪下去，`flashCtrl_isFlashDone` 恒为 0，`flashCtrl_getFlashCnt` 是累计值（65535 封顶）；
+- `cycles > 0`：闪满即置位 `done`，句柄留在节拍链表但不再推进；终态由 `endState` 决定——`ON` 停在动作态（亮/鸣），`OFF` 与 `KEEP` 都停在静止态（灭/静）。注意这里的 `KEEP` 与 `flashCtrl_stop` 的口径不同：按节拍跑完最后一圈本来就要切回静止态，`KEEP` 只是“不额外干预”，结果与 `OFF` 相同；想让灯亮着收尾请传 `ON`。闪满后可用 `flashCtrl_reset` 让同一套参数再跑一遍，或重新 `setThdMs`。
 
 上面各处的时长都用毫秒给，库内按 `FLASH_CTRL_CYCLE_MS` 换算成拍：
 `节拍数 = (毫秒数 + 周期 - 1) / 周期`（向上取整）。例如周期 10ms，设 50ms/150ms → 5 拍/15 拍。
@@ -215,15 +224,21 @@ static uint8_t led0_is_on(void)   { return P42 ? 0 : 1; }   /* 1：点亮，0：
 led0 = flashCtrl_init(led0_turn_on, led0_turn_off, led0_is_on);
 if (NULL == led0) { /* 池满：调大 FLASH_CTRL_ACTUATOR_NUM */ }
 
-flashCtrl_setThdMs(led0, 50, 150);       /* 亮 50ms、灭 150ms（10ms 一拍下即 5 拍 / 15 拍） */
+flashCtrl_setThdMs(led0, 50, 150, 0, FLASH_CTRL_STS_KEEP);   /* 亮 50ms、灭 150ms（10ms 一拍下即 5 拍 / 15 拍），无限次 */
 
 flashCtrl_start(led0);               /* 加入调度链表 */
 
 /* 固定节拍（如定时器 10ms 中断或主循环延时）中调用 */
 flashCtrl_ticks();
 
+/* 只闪 3 次、闪满后停在熄灭：cycles=3，endState=OFF */
+flashCtrl_setThdMs(led0, 50, 150, 3, FLASH_CTRL_STS_OFF);
+if (flashCtrl_isFlashDone(led0)) {
+    /* 已闪满 3 次、不再推进；已完成次数可用 flashCtrl_getFlashCnt(led0) 查 */
+}
+
 /* 需要停止时，可选择停止后的末态 */
-flashCtrl_stop(led0, FLASH_CTRL_STS_IDLE);   /* 停在熄灭；KEEP 保持原状，ACTIVE 停在点亮 */
+flashCtrl_stop(led0, FLASH_CTRL_STS_OFF);   /* 停在熄灭；KEEP 保持原状，ON 停在点亮 */
 
 /* 需要彻底释放时，同样指定末态（KEEP 表示只回收资源、不动执行器） */
 flashCtrl_deinit(led0, FLASH_CTRL_STS_KEEP);

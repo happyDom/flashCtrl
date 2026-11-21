@@ -38,11 +38,14 @@ static uint8_t buzzer_is_on(void)  { return BEEP_ON_STS(); }
 
 void main(void){
     led0 = flashCtrl_init(led0_turn_on, led0_turn_off, led0_is_on);   // 注册失败时返回 0（空指针），由调用方自行处理
-    flashCtrl_setThdMs(led0, 50, 150);  // 亮 50ms、灭 150ms（10ms 一拍下即 5 拍 / 15 拍）
+    /* 亮 50ms、灭 150ms（10ms 一拍下即 5 拍 / 15 拍）；cycles=0 一直闪、
+       endState 只在有限次数时用得上（这里保持此刻状态） */
+    flashCtrl_setThdMs(led0, 50, 150, 0, FLASH_CTRL_STS_KEEP);
     flashCtrl_start(led0);              // 提交启动请求，由 flashCtrl_ticks() 在下一拍挂链（异步）
 
     buzzer = flashCtrl_init(buzzer_turn_on, buzzer_turn_off, buzzer_is_on);
-    flashCtrl_setThdMs(buzzer, 20, 280);   // 鸣 20ms、停 280ms（10ms 一拍 → 2 拍 / 28 拍）
+    /* 鸣 20ms、停 280ms（10ms 一拍 → 2 拍 / 28 拍），同样无限次 */
+    flashCtrl_setThdMs(buzzer, 20, 280, 0, FLASH_CTRL_STS_KEEP);
     flashCtrl_start(buzzer);            // 同上：请求式，下一拍生效
 
     // 配置灯语参数，长亮时间 / 短亮时间 / 闪烁间熄灭时间 / 首尾(两次灯语间间隔）熄灭时间
@@ -55,7 +58,13 @@ void main(void){
         flashCtrl_ticks();   /* 所有已启动的执行器在此推进节拍 */
 
         // 运行中修改闪烁时长（按毫秒指定，内部按 FLASH_CTRL_CYCLE_MS 换算成节拍数）
-        // flashCtrl_setThdMs(led0, on_ms, off_ms);
+        // flashCtrl_setThdMs(led0, on_ms, off_ms, cycles, endState);
+
+        // 只闪有限次，闪满后停在指定终态（cycles=0 表示一直闪下去）
+        // flashCtrl_setThdMs(led0, 200, 200, 3, FLASH_CTRL_STS_OFF);   // 闪 3 次，最后停在熄灭
+        // if (flashCtrl_isFlashDone(led0)) {                                // 轮询：已闪满、不再推进
+        //     // 已完成的次数也可以用 flashCtrl_getFlashCnt(led0) 查
+        // }
 
         // 需要“长亮 N 次 + 短亮 M 次”这类灯语报错时，同一个句柄直接切成灯语模式即可（模式互斥）
         // flashCtrl_startLang(led0, 3, 2, 2);        // 触发：3 次长亮 + 2 次短亮，报 2 轮后自停（cycles=0 为无限重复）
@@ -70,14 +79,14 @@ void main(void){
         // flashCtrl_exitLangMode(led0);
 
         // 可以随时停止闪烁，停在熄灭状态，句柄仍保留（可再次 start 继续闪）
-        // flashCtrl_stop(buzzer, FLASH_CTRL_STS_IDLE);
+        // flashCtrl_stop(buzzer, FLASH_CTRL_STS_OFF);
 
         // 也可以彻底释放：先按指定末态停止（这里停成熄灭），再归还句柄（资源供其它执行器复用）
-        // flashCtrl_deinit(led0, FLASH_CTRL_STS_IDLE);   /* 归还内存池资源；KEEP 则只回收资源、不动 LED */
+        // flashCtrl_deinit(led0, FLASH_CTRL_STS_OFF);   /* 归还内存池资源；KEEP 则只回收资源、不动 LED */
 
         // 需要“非闪烁”的稳态时（常亮 / 常灭），直接用这两个接口，不必自己去凑阈值：
-        // flashCtrl_turnOn(led0);        // 常亮 = setThdMs(1, 0)：off=0 不熄灭，点亮后保持
-        // flashCtrl_turnOff(led0);       // 常灭 = setThdMs(0, 1)：on=0 不点亮，熄灭后保持
-        // 之后想恢复闪烁：flashCtrl_setThdMs(led0, 500, 500);  （句柄一直在链表里，不用再 start）
+        // flashCtrl_turnOn(led0);        // 常亮 = setThdMs(1, 0, 0, KEEP)：off=0 不熄灭，点亮后保持
+        // flashCtrl_turnOff(led0);       // 常灭 = setThdMs(0, 1, 0, KEEP)：on=0 不点亮，熄灭后保持
+        // 之后想恢复闪烁：flashCtrl_setThdMs(led0, 500, 500, 0, FLASH_CTRL_STS_KEEP);  （句柄一直在链表里，不用再 start）
     }
 }

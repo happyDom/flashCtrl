@@ -103,13 +103,14 @@ typedef void (*io_ctrl_func)(void);
  * 低电平点亮的 LED 写成 return (P42 ? 0 : 1);。 */
 typedef uint8_t (*io_is_on_func)(void);
 
-/* 停止节拍控制时，执行器的末态要求（用于 flashCtrl_stop / flashCtrl_deinit 的参数，
- * 与 is_on 的返回值含义无关，避免两者混淆故单独定义） */
+/* 执行器的目标状态，用于 flashCtrl_stop / flashCtrl_deinit 的末态参数与
+ * flashCtrl_setThdMs 的“闪满后终态”参数（与 is_on 的返回值含义无关，避免两者混淆故单独定义）
+ * 取值与动作接口呼应：ON ≡ turnOn（动作态）、OFF ≡ turnOff（静止态）、KEEP 不动执行器 */
 typedef enum {
-    FLASH_CTRL_STS_KEEP   = 0,   /* 保持执行器当前状态，不做任何切换 */
-    FLASH_CTRL_STS_ACTIVE = 1,   /* 停止后进入动作态（点亮 LED / 蜂鸣器鸣叫） */
-    FLASH_CTRL_STS_IDLE   = 2,   /* 停止后进入静止态（熄灭 LED / 蜂鸣器静默） */
-} flashCtrlOffState_t;
+    FLASH_CTRL_STS_KEEP = 0,   /* 保持执行器当前状态，不做任何切换 */
+    FLASH_CTRL_STS_ON   = 1,   /* 进入动作态（点亮 LED / 蜂鸣器鸣叫），等价 turnOn */
+    FLASH_CTRL_STS_OFF  = 2,   /* 进入静止态（熄灭 LED / 蜂鸣器静默），等价 turnOff */
+} flashCtrlState_t;
 
 /* 句柄的工作模式：一个执行器同一时刻只处于一种模式 */
 typedef enum {
@@ -129,6 +130,8 @@ typedef struct FlashCtrl {
     io_is_on_func is_on;    /* 状态读取的注册函数：1 = 动作态（亮），0 = 静止态（灭） */
     uint16_t     on_thd;    /* 简单模式：动作态节拍数，0：不动作（保持静止） */
     uint16_t     off_thd;   /* 简单模式：静止态节拍数，0：不停止（保持动作） */
+    uint16_t     cycles;    /* 简单模式：需要闪烁的次数，0 表示一直闪下去（由 setThdMs 设置） */
+    uint8_t      endState;  /* 简单模式：闪满 cycles 次后的终态（flashCtrlState_t，由 setThdMs 设置） */
     uint8_t      mode;      /* flashCtrlMode_t，由库内维护 */
     uint8_t      inUse;     /* 内存池槽位占用标志，由库内维护，调用方不要改写 */
     struct FlashCtrl* next; /* 多实例工作时链表指针，由库内维护 */
@@ -136,13 +139,15 @@ typedef struct FlashCtrl {
     /* 启停/释放请求：调用方通过 start/stop/deinit 只写这两个单字节（最后一个写入即“提交”），
      * 由 ticks 读取并执行。单字节写在 8051 上也是原子的，不会读到“半个指针”。 */
     volatile uint8_t pendingReq;      /* 请求码：0=无，1=启动，2=停止，3=释放 */
-    volatile uint8_t pendingOffState; /* 请求携带的末态参数（flashCtrlOffState_t） */
+    volatile uint8_t pendingOffState; /* 请求携带的末态参数（flashCtrlState_t） */
 
     union {
-        /* 简单模式的进度 */
+        /* 简单模式的进度（参数在联合体外面，切到灯语再切回来时不会丢） */
         struct {
             uint16_t on_cnt;        /* 动作态已计节拍数，由库内维护 */
             uint16_t off_cnt;       /* 静止态已计节拍数，由库内维护 */
+            uint16_t cycleCnt;      /* 已完成的闪烁次数，由库内维护 */
+            uint8_t  done;          /* 1 = 已闪满设定次数、停在终态（由库内维护） */
         } simple;
 #if FLASH_CTRL_LANG_EN
         /* 灯语模式：长亮 N 次 + 短亮 M 次 + 收尾熄灭，跑完指定轮数后自停 */
@@ -168,20 +173,45 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_is_on_
 /* 请求释放（异步）：只登记请求，实际摘链 + 末态处理 + 归还槽位由 flashCtrl_ticks() 在下一拍执行，
  * 口径与 flashCtrl_stop 完全一致。offState 传 FLASH_CTRL_STS_KEEP 表示只回收资源、不动执行器。
  * 执行完成后槽位可被后续 flashCtrl_init 复用。 */
-void flashCtrl_deinit(FlashCtrl* handle, flashCtrlOffState_t offState);
+void flashCtrl_deinit(FlashCtrl* handle, flashCtrlState_t offState);
 
 /* 查询内存池中已分配的句柄数量 / 内存池容量 */
 uint16_t flashCtrl_getUsedCount(void);
 uint16_t flashCtrl_getCapacity(void);
 
-/* 设置动作态/静止态的时长（简单模式），单位毫秒；会清零节拍计数并让句柄回到简单模式。
+/* 设置简单模式的参数：动作态/静止态时长（毫秒）+ 闪烁次数 + 闪满后的终态。
+ *   on_ms   : 动作态时长（点亮/鸣叫），0 表示不进入动作态；
+ *   off_ms  : 静止态时长（熄灭/静默），0 表示不进入静止态；
+ *   cycles  : 需要闪烁几次，0 表示一直闪下去（不结束）；
+ *             一次闪烁 = 静止段 → 动作段 → 回到静止段 的完整一圈（在动作段结束、切回静止态的那一刻计数 +1），
+ *             所以 on_ms=0 或 off_ms=0 时永远凑不齐一整圈，cycles 实际不起作用（常亮/常灭请直接传 0）；
+ *   endState: 闪满 cycles 次后的终态，取值同 flashCtrlState_t：
+ *             FLASH_CTRL_STS_ON 停在动作态（亮/鸣）、
+ *             FLASH_CTRL_STS_OFF 与 FLASH_CTRL_STS_KEEP 都停在静止态（灭/静）。
+ *             注意 KEEP 在这里与 flashCtrl_stop 不同：闪烁按节拍走完最后一圈本来就要切回静止态，
+ *             所以 KEEP 只是“不额外干预执行器”，结果与 OFF 相同，不会把执行器留在动作态。
+ *             想让灯亮着收尾就传 ON。
+ * 会清零节拍计数与次数进度，并让句柄回到简单模式（等于退出灯语）；
+ * 闪满次数后句柄仍在节拍链表里，但不再推进（可用 flashCtrl_isFlashDone 查询），
+ * 需要重新开始时再调一次本接口或 flashCtrl_reset。
  * 库内用 FLASH_CTRL_CYCLE_MS 换算成拍（向上取整，非 0 毫秒至少 1 拍；0 毫秒 = 不进入该相位）。
  * 单位口径：本库对外只用毫秒；内部“拍”= flashCtrl_ticks() 的调用周期，
  *   它是集成参数（FLASH_CTRL_CYCLE_MS），与应用层自己的节拍无关。
  * 精度受拍长限制：实际时长 = 拍数 × FLASH_CTRL_CYCLE_MS（10ms 一拍时给 5ms 实际为 10ms）。 */
-void flashCtrl_setThdMs(FlashCtrl* handle, uint16_t on_ms, uint16_t off_ms);
+void flashCtrl_setThdMs(FlashCtrl* handle, uint16_t on_ms, uint16_t off_ms,
+                        uint16_t cycles, flashCtrlState_t endState);
 
-/* 清零当前阶段的进度计数，不改变阈值、模式与执行器状态 */
+/* 简单模式是否已闪满设定次数：1 已闪满（此时停在 endState 指定的终态、不再推进），0 未闪满；
+ * cycles 传 0（一直闪下去）、句柄为空或当前不在简单模式时恒返回 0。
+ * 灯语模式的完成查询用 flashCtrl_isLangDone（口径是“跑满轮数”，与本接口不通用）。 */
+uint8_t flashCtrl_isFlashDone(FlashCtrl* handle);
+
+/* 简单模式已完成的闪烁次数（cycles=0 时是累计值，达到 65535 后饱和）；
+ * 句柄为空或当前不在简单模式时返回 0。 */
+uint16_t flashCtrl_getFlashCnt(FlashCtrl* handle);
+
+/* 清零当前阶段的进度计数（简单模式清节拍计数与次数进度、灯语模式清阶段计时），
+ * 不改变阈值、模式与执行器状态。闪满次数后调用它可以让同一套参数再跑一遍。 */
 void flashCtrl_reset(FlashCtrl* handle);
 
 /* 提交“启动”请求（异步）：句柄由 flashCtrl_ticks() 在下一拍挂入工作链表；
@@ -191,14 +221,14 @@ void flashCtrl_reset(FlashCtrl* handle);
 int flashCtrl_start(FlashCtrl* handle);
 
 /* 提交“停止”请求（异步）：由 flashCtrl_ticks() 在下一拍摘链并按 offState 处理末态
- * （FLASH_CTRL_STS_KEEP 不改动执行器；ACTIVE/IDLE 会切换状态并清零节拍计数）。 */
-void flashCtrl_stop(FlashCtrl* handle, flashCtrlOffState_t offState);
+ * （FLASH_CTRL_STS_KEEP 不改动执行器；ON/OFF 会切换状态并清零节拍计数）。 */
+void flashCtrl_stop(FlashCtrl* handle, flashCtrlState_t offState);
 
 /* ---------------- 两个“稳态”快捷接口（语义糖） ----------------
  * 作用：让“常亮 / 常灭”这个意图在调用处一眼可见，不必自己去凑阈值。
  * 实现上就是阈值的一个特例，句柄照旧留在节拍链表里：
- *   flashCtrl_turnOn (h) ≡ flashCtrl_setThdMs(h, 1, 0)   → 熄灭态一拍内被点亮，之后保持
- *   flashCtrl_turnOff(h) ≡ flashCtrl_setThdMs(h, 0, 1)   → 点亮态一拍内被熄灭，之后保持
+ *   flashCtrl_turnOn (h) ≡ flashCtrl_setThdMs(h, 1, 0, 0, FLASH_CTRL_STS_KEEP)   → 熄灭态一拍内被点亮，之后保持
+ *   flashCtrl_turnOff(h) ≡ flashCtrl_setThdMs(h, 0, 1, 0, FLASH_CTRL_STS_KEEP)   → 点亮态一拍内被熄灭，之后保持
  * 为什么这样可行（简单模式的判据）：
  *   - off_thd = 0 表示“不熄灭”，于是只要处于动作态就永远停在那里（on_thd 不参与判断）；
  *   - on_thd  = 0 表示“不点亮”，于是只要处于静止态就永远停在那里（off_thd 不参与判断）。
@@ -207,7 +237,8 @@ void flashCtrl_stop(FlashCtrl* handle, flashCtrlOffState_t offState);
  *   - 同步：立即改写阈值并清节拍计数，下一拍由 flashCtrl_ticks 把执行器带到目标态；句柄必须已经 start，
  *     否则只改了阈值、没人推进；
  *   - 每拍都会按 is_on 纠偏：期间若有别的代码直接动了端口，下一拍会被拉回目标态；
- *   - 会覆盖之前的 on_thd / off_thd（并切回简单模式，退出灯语），想恢复闪烁要重新 setThdMs；
+ *   - 会覆盖之前的 on_thd / off_thd / cycles / endState（并切回简单模式，退出灯语），
+ *     所以把有限次闪烁改成常亮后次数自然失效；想恢复闪烁要重新 setThdMs；
  *   - 句柄为 0（空指针）时安全返回。 */
 void flashCtrl_turnOn(FlashCtrl* handle);
 void flashCtrl_turnOff(FlashCtrl* handle);
