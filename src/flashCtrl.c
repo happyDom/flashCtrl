@@ -17,8 +17,9 @@
  *     在多处被混用、重复初始化；
  *   - 内存池大小由用户项目的 userFlashCtrlCfg.h 中 FLASH_CTRL_ACTUATOR_NUM 决定，
  *     不需要动态内存，也不依赖 string.h 等库函数（不使用 memset）；
- *   - 对外只暴露必要接口：分配/释放、设置时长、启停调度、查询用量；
+ *   - 对外只暴露必要接口：分配句柄、设置时长与次数、启停调度；
  *     单个句柄的节拍处理 flashCtrl_toggle 是库内私有函数，不对外暴露。
+ *     句柄数量由编译期配置决定、分配后不再归还，所以不提供动态释放与用量查询接口。
  *
  * 两种模式：
  *   1) 简单模式：灭 off_thd 拍后动作、动作 on_thd 拍后停止，无限循环；
@@ -73,18 +74,15 @@ static FlashCtrl* head_handle;                          /* 调度链表头 */
  *   1) 句柄里不存在空函数指针，ticks 内部不必逐拍判空；
  *   2) 调用方依旧可以传 0（空指针，见 flashCtrl_init），由 init 统一替换为空实现。 */
 static void    flashCtrl_noOp(void)    { }                /* 空动作：什么也不做 */
-static uint8_t flashCtrl_isOff(void)   { return 0; }      /* 空查询：视为静止态（返回 0） */
 
 /* ---- 请求码：调用方只写两个单字节，链表操作一律在 ticks 上下文里完成 ---- */
 #define FLASH_REQ_NONE      0u
 #define FLASH_REQ_START     1u
 #define FLASH_REQ_STOP      2u
-#define FLASH_REQ_DEINIT    3u
 
 static void clearProgress(FlashCtrl* handle);
 static void doStart(FlashCtrl* handle);
 static void doStop(FlashCtrl* handle, flashCtrlState_t offState);
-static void doDeinit(FlashCtrl* handle, flashCtrlState_t offState);
 static void serviceRequests(void);
 
 /* 取池中第 idx 个槽位的地址 */
@@ -130,6 +128,7 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_is_on_
             handle->u.simple.on_cnt   = 0;
             handle->u.simple.off_cnt  = 0;
             handle->u.simple.cycleCnt = 0;
+            handle->u.simple.flashed  = 0;
             handle->u.simple.done     = 0;
 #if FLASH_CTRL_LANG_EN
             handle->u.lang.phaseCnt   = 0;
@@ -147,109 +146,6 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_is_on_
     }
 
     return 0;   // 池满
-}
-
-/**
-  * @brief  释放句柄：先按 offState 停止节拍控制，再清空槽位，槽位可被后续 flashCtrl_init 复用。
-  * @param  handle:   闪烁控制句柄
-  * @param  offState: 停止时的执行器末态，口径与 flashCtrl_stop 一致；
-  *                   FLASH_CTRL_STS_KEEP 表示只回收资源、不改动执行器状态
-  * @retval None
-  */
-void flashCtrl_deinit(FlashCtrl* handle, flashCtrlState_t offState) {
-    if(0 == handle || 0 == handle->inUse) return;   // 入口判空：调用方可能传空指针或已释放的句柄
-
-    /* 只登记请求：两个单字节写入，不碰链表，也不会让 ISR 读到“半个指针” */
-    handle->pendingOffState = (uint8_t)offState;
-    handle->pendingReq      = FLASH_REQ_DEINIT;
-}
-
-/* 实际的释放动作：只在 flashCtrl_ticks() -> serviceRequests() 里执行 */
-static void doDeinit(FlashCtrl* handle, flashCtrlState_t offState) {
-    FlashCtrl** curr;
-
-    /* 摘链 */
-    for(curr = &head_handle; *curr; ){
-        if(*curr == handle){
-            *curr        = (*curr)->next;
-            handle->next = 0;
-            break;
-        } else {
-            curr = &(*curr)->next;
-        }
-    }
-
-    /* 按调用方要求处理执行器末态；turn_on/turn_off 由 init/deinit 保证是“可调用”的，无需判空 */
-    switch(offState){
-    case FLASH_CTRL_STS_ON:
-        handle->turn_on();
-        clearProgress(handle);
-        break;
-
-    case FLASH_CTRL_STS_OFF:
-        handle->turn_off();
-        clearProgress(handle);
-        break;
-
-    case FLASH_CTRL_STS_KEEP:
-    default:
-        break;
-    }
-
-    /* 归还槽位：函数指针回到“空实现”而不是通用空指针（避免指针宽度不同导致截断） */
-    handle->turn_on  = flashCtrl_noOp;
-    handle->turn_off = flashCtrl_noOp;
-    handle->is_on    = flashCtrl_isOff;
-    handle->mode     = FLASH_CTRL_MODE_SIMPLE;
-    handle->next     = 0;
-
-    handle->on_thd  = 0;
-    handle->off_thd = 0;
-    handle->cycles  = 0;
-    handle->endState = FLASH_CTRL_STS_KEEP;
-    handle->u.simple.on_cnt   = 0;
-    handle->u.simple.off_cnt  = 0;
-    handle->u.simple.cycleCnt = 0;
-    handle->u.simple.done     = 0;
-#if FLASH_CTRL_LANG_EN
-    handle->u.lang.phaseCnt   = 0;
-    handle->u.lang.cycleCnt   = 0;
-    handle->u.lang.longTotal  = 0;
-    handle->u.lang.shortTotal = 0;
-    handle->u.lang.cycles     = 0;
-    handle->u.lang.longDone   = 0;
-    handle->u.lang.shortDone  = 0;
-    handle->u.lang.phase      = LANG_PH_OFF;
-    handle->u.lang.isOn       = 0;
-#endif
-
-    handle->pendingReq = FLASH_REQ_NONE;   /* 先清挂起请求，再归还槽位 */
-    handle->inUse      = 0;                /* 最后归还槽位，此后 init 可复用 */
-}
-
-/**
-  * @brief  查询内存池中已分配的句柄数量。
-  * @param  None
-  * @retval 已使用的槽位数
-  */
-uint16_t flashCtrl_getUsedCount(void) {
-    uint16_t i;
-    uint16_t used = 0;
-
-    for(i = 0; i < (uint16_t)FLASH_CTRL_ACTUATOR_NUM; i++){
-        if(slotPtr(i)->inUse) used++;
-    }
-
-    return used;
-}
-
-/**
-  * @brief  查询内存池容量，即 FLASH_CTRL_ACTUATOR_NUM。
-  * @param  None
-  * @retval 可分配的执行器数量
-  */
-uint16_t flashCtrl_getCapacity(void) {
-    return (uint16_t)FLASH_CTRL_ACTUATOR_NUM;
 }
 
 /**
@@ -275,6 +171,7 @@ void flashCtrl_setThdMs(FlashCtrl* handle, uint16_t on_ms, uint16_t off_ms,
     handle->u.simple.on_cnt   = 0;
     handle->u.simple.off_cnt  = 0;
     handle->u.simple.cycleCnt = 0;
+    handle->u.simple.flashed  = 0;
     handle->u.simple.done     = 0;
 }
 
@@ -313,6 +210,7 @@ static void clearProgress(FlashCtrl* handle) {
         handle->u.simple.on_cnt   = 0;
         handle->u.simple.off_cnt  = 0;
         handle->u.simple.cycleCnt = 0;
+        handle->u.simple.flashed  = 0;
         handle->u.simple.done     = 0;   /* 清掉“已闪满”标志，同一套参数可以再跑一遍 */
     }
 #if FLASH_CTRL_LANG_EN
@@ -360,34 +258,43 @@ static void flashCtrl_toggle(FlashCtrl* handle) {
         if(on_thd == 0){   // 动作阈值为0，则保持静止状态，不进入动作态
             FLASH_CNT_INC(handle->u.simple.off_cnt);
         } else if(handle->u.simple.off_cnt >= off_thd){
-            handle->turn_on();   // 静止节拍已到，进入动作态
-
             handle->u.simple.off_cnt = 0;
-            handle->u.simple.on_cnt  = 0;
+
+            if(0 == handle->u.simple.flashed){
+                /* 起始那段静止（或从外部点亮状态切回来后的第一段）：只是等待第一次亮，不计次 */
+                handle->u.simple.flashed = 1;
+                handle->turn_on();
+            } else {
+                /* 灭段走完：上一个“亮段 + 灭段”到此构成一次完整的闪烁，计数 +1 */
+                FLASH_CNT_INC(handle->u.simple.cycleCnt);
+
+                if(0 != handle->cycles && handle->u.simple.cycleCnt >= handle->cycles){
+                    handle->u.simple.done = 1;   // 闪满：此后不再推进
+
+                    /* 收尾：正常节拍此刻本该点亮，所以 ON 只是照常点亮后停住；
+                       OFF / KEEP 都不再点亮，直接停在熄灭
+                       （KEEP 与 stop 的口径不同，这里停在静止态而不是“留在点亮”） */
+                    if(FLASH_CTRL_STS_ON == handle->endState){
+                        handle->turn_on();
+                    }
+                } else {
+                    handle->turn_on();
+                }
+            }
         } else {
             FLASH_CNT_INC(handle->u.simple.off_cnt);
         }
     } else {   // 执行器当前处于动作态
+        if(0 == handle->u.simple.flashed){
+            handle->u.simple.flashed = 1;   // 已经在亮（例如在点亮状态下重设了参数）：这段亮就算第一次
+        }
+
         if(off_thd == 0){   // 停止阈值为0，则保持动作状态，不进入静止态
             FLASH_CNT_INC(handle->u.simple.on_cnt);
         } else if(handle->u.simple.on_cnt >= on_thd){
+            handle->u.simple.on_cnt  = 0;   // 亮段计时到，切回静止态（计数在灭段走完后才做）
             handle->u.simple.off_cnt = 0;
-            handle->u.simple.on_cnt  = 0;
-
-            /* 动作段结束、切回静止：到这里算完成一次闪烁 */
-            FLASH_CNT_INC(handle->u.simple.cycleCnt);
             handle->turn_off();
-
-            if(0 != handle->cycles && handle->u.simple.cycleCnt >= handle->cycles){
-                handle->u.simple.done = 1;   // 闪满：此后不再推进
-
-                /* 终态只在“要停在动作态”时需要额外动作；
-                   静止态在正常节拍里已经切过去了，KEEP 也就不再干预硬件
-                   （注意：与 flashCtrl_stop 的 KEEP 口径不同，这里停在静止态而不是“留在点亮”） */
-                if(FLASH_CTRL_STS_ON == handle->endState){
-                    handle->turn_on();
-                }
-            }
         } else {
             FLASH_CNT_INC(handle->u.simple.on_cnt);
         }
@@ -678,7 +585,7 @@ void flashCtrl_resetLangCycle(FlashCtrl* handle) {
   * @retval 0：成功；-1：句柄非法或已在链表中
   */
 int flashCtrl_start(FlashCtrl* handle) {
-    if(0 == handle || 0 == handle->inUse) return -1;   // 入口判空：调用方可能传空指针或已释放的句柄
+    if(0 == handle || 0 == handle->inUse) return -1;   // 入口判空：调用方可能传空指针
 
     handle->pendingReq = FLASH_REQ_START;   // 单字节写即“提交”，由 ticks 下一拍挂链
     return 0;
@@ -706,7 +613,7 @@ static void doStart(FlashCtrl* handle) {
   * @retval None
   */
 void flashCtrl_stop(FlashCtrl* handle, flashCtrlState_t offState) {
-    if(0 == handle || 0 == handle->inUse) return;   // 入口判空：调用方可能传空指针或已释放的句柄
+    if(0 == handle || 0 == handle->inUse) return;   // 入口判空：调用方可能传空指针
 
     handle->pendingOffState = (uint8_t)offState;
     handle->pendingReq      = FLASH_REQ_STOP;
@@ -774,7 +681,7 @@ static void doStop(FlashCtrl* handle, flashCtrlState_t offState) {
 void flashCtrl_ticks(void) {
     FlashCtrl* target;
 
-    /* 1) 先把主循环提交的启动/停止/释放请求执行掉：
+    /* 1) 先把主循环提交的启动/停止请求执行掉：
        链表只在这里被改动，因此调用方不必自己做临界区，也不存在
        “ticks 正在遍历、主循环同时摘链”的竞争 */
     serviceRequests();
@@ -805,17 +712,16 @@ static void serviceRequests(void) {
         req = h->pendingReq;
         if(FLASH_REQ_NONE == req) continue;
 
-        if(0 == h->inUse){                     /* 槽位已释放：丢弃残留请求 */
+        if(0 == h->inUse){                     /* 槽位空闲（未分配）：丢弃残留请求 */
             h->pendingReq = FLASH_REQ_NONE;
             continue;
         }
 
         off = h->pendingOffState;
         switch(req){
-        case FLASH_REQ_START:  doStart(h);                                break;
-        case FLASH_REQ_STOP:   doStop(h, (flashCtrlState_t)off);       break;
-        case FLASH_REQ_DEINIT: doDeinit(h, (flashCtrlState_t)off);     break;
-        default:                                                          break;
+        case FLASH_REQ_START:  doStart(h);                            break;
+        case FLASH_REQ_STOP:   doStop(h, (flashCtrlState_t)off);      break;
+        default:                                                      break;
         }
 
         /* 执行期间若又提交了新请求（值不同）则保留到下一拍；值相同视为本次已处理 */
