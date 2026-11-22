@@ -147,7 +147,9 @@ typedef struct FlashCtrl {
             uint16_t on_cnt;        /* 动作态已计节拍数，由库内维护 */
             uint16_t off_cnt;       /* 静止态已计节拍数，由库内维护 */
             uint16_t cycleCnt;      /* 已完成的闪烁次数，由库内维护 */
-            uint8_t  flashed;       /* 1 = 已经亮过一次（区分“起始等待段”与“闪烁间的熄灭段”） */
+            uint8_t  flashed;       /* 1 = 已进入正式闪烁循环（起步动作做完了） */
+            uint8_t  gap;           /* 1 = 正在补一个完整灭段（起步时原为点亮 / 收尾要停在 ON） */
+            uint8_t  finishOn;      /* 1 = 这个补出来的灭段结束后要点亮并停住（收尾用） */
             uint8_t  done;          /* 1 = 已闪满设定次数、停在终态（由库内维护） */
         } simple;
 #if FLASH_CTRL_LANG_EN
@@ -176,16 +178,16 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_is_on_
  *   on_ms   : 动作态时长（点亮/鸣叫），0 表示不进入动作态；
  *   off_ms  : 静止态时长（熄灭/静默），0 表示不进入静止态；
  *   cycles  : 需要闪烁几次（数“亮的次数”），0 表示一直闪下去（不结束）；
- *             一次闪烁 = 动作段（亮/鸣） + 其后的静止段（灭/静），在静止段走完、本该再次点亮的那一拍计数 +1；
- *             因此 cycles=2 的波形是“亮、灭、亮、灭”，再按 endState 收尾（ON 即再点亮并保持）；
- *             起始那段静止只是等待第一次亮，不计次；
- *             所以 on_ms=0 或 off_ms=0 时永远凑不齐一次，cycles 实际不起作用（常亮/常灭请直接传 0）；
+ *             一次闪烁 = 一个动作段（亮/鸣），亮段走完就计数 +1；
+ *             所以 cycles=2 时看到“亮、灭、亮、灭”，再按 endState 收尾；
+ *             on_ms=0 或 off_ms=0 时凑不齐闪烁，cycles 实际不起作用（常亮/常灭请直接传 0）；
+ *   起步与收尾都要把“灭段”与前后状态连起来，避免两个亮段首尾相接：
+ *             起步时若当前是静止态（灭）→ 立刻进入动作态开始闪（不再等一个灭段）；
+ *             起步时若当前是动作态（亮）→ 先切灭，补满一个完整 off_ms 的灭段，再开始闪；
  *   endState: 闪满 cycles 次后的终态，取值同 flashCtrlState_t：
- *             FLASH_CTRL_STS_ON 照常点亮后停住（亮/鸣）、
- *             FLASH_CTRL_STS_OFF 与 FLASH_CTRL_STS_KEEP 都不再点亮，停在静止态（灭/静）。
- *             注意 KEEP 在这里与 flashCtrl_stop 不同：闪满时正常节拍本该再次点亮，
- *             所以 KEEP 只是“不额外干预执行器”，结果与 OFF 相同，不会把执行器留在动作态。
- *             想让灯亮着收尾就传 ON。
+ *             FLASH_CTRL_STS_ON 先补满一个完整 off_ms 的灭段，再点亮并停住（亮/鸣）、
+ *             FLASH_CTRL_STS_OFF 亮段一结束就停住（灭/静）、
+ *             FLASH_CTRL_STS_KEEP 与 OFF 相同（这里“不额外干预”就是保持熄灭）。
  * 会清零节拍计数与次数进度，并让句柄回到简单模式（等于退出灯语）；
  * 闪满次数后句柄仍在节拍链表里，但不再推进（可用 flashCtrl_isFlashDone 查询），
  * 需要重新开始时再调一次本接口或 flashCtrl_reset。

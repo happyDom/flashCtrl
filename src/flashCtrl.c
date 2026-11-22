@@ -22,7 +22,9 @@
  *     句柄数量由编译期配置决定、分配后不再归还，所以不提供动态释放与用量查询接口。
  *
  * 两种模式：
- *   1) 简单模式：灭 off_thd 拍后动作、动作 on_thd 拍后停止，无限循环；
+ *   1) 简单模式：亮 on_thd 拍、灭 off_thd 拍交替循环；起步时若当前亮着则先补满一个
+ *      灭段再开始，若当前灭着则立刻点亮；闪满次数后按 endState 收尾（要停在 ON 的
+ *      同样先补满一个灭段），保证任意两个亮段之间都有完整熄灭；
  *   2) 灯语模式：起始熄灭(可选) → [长亮]*N → 组间熄灭 → [短亮]*M → 收尾熄灭，
  *      轮数在触发时一次给定，跑满设定轮数后自停（停在熄灭态），调用方查 flashCtrl_isLangDone
  *      后再切换下一个错误码；cycles 传 0 表示无限重复（常驻故障指示）。
@@ -129,6 +131,8 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_is_on_
             handle->u.simple.off_cnt  = 0;
             handle->u.simple.cycleCnt = 0;
             handle->u.simple.flashed  = 0;
+            handle->u.simple.gap      = 0;
+            handle->u.simple.finishOn = 0;
             handle->u.simple.done     = 0;
 #if FLASH_CTRL_LANG_EN
             handle->u.lang.phaseCnt   = 0;
@@ -172,6 +176,8 @@ void flashCtrl_setThdMs(FlashCtrl* handle, uint16_t on_ms, uint16_t off_ms,
     handle->u.simple.off_cnt  = 0;
     handle->u.simple.cycleCnt = 0;
     handle->u.simple.flashed  = 0;
+    handle->u.simple.gap      = 0;
+    handle->u.simple.finishOn = 0;
     handle->u.simple.done     = 0;
 }
 
@@ -211,6 +217,8 @@ static void clearProgress(FlashCtrl* handle) {
         handle->u.simple.off_cnt  = 0;
         handle->u.simple.cycleCnt = 0;
         handle->u.simple.flashed  = 0;
+        handle->u.simple.gap      = 0;
+        handle->u.simple.finishOn = 0;
         handle->u.simple.done     = 0;   /* 清掉“已闪满”标志，同一套参数可以再跑一遍 */
     }
 #if FLASH_CTRL_LANG_EN
@@ -234,67 +242,91 @@ void flashCtrl_reset(FlashCtrl* handle) {
 
 /**
   * @brief  简单模式的节拍处理（库内私有）：等价于通用化后的 led0_toggle。
+  *         起步与收尾都要考虑“前后状态的灭段连起来”，避免两个亮段首尾相接：
+  *           - 起步时当前是灭的 → 立即点亮开始闪；
+  *           - 起步时当前是亮的 → 先灭，补一个完整灭段（off_ms）再开始闪；
+  *           - 闪满后要停在 ON  → 先补一个完整灭段，再点亮并停住；
+  *           - 闪满后要停在 OFF → 亮段一结束就灭，直接停住。
   * @param  handle: 闪烁控制句柄
   * @retval None
   */
 static void flashCtrl_toggle(FlashCtrl* handle) {
-    uint8_t isOn;
+    uint8_t  isOn = handle->is_on();   // 执行器当前状态（1：动作态/亮，0：静止态/灭）
     uint16_t on_thd  = handle->on_thd;
     uint16_t off_thd = handle->off_thd;
 
-    /* 已闪满设定次数：停在终态，不再推进 */
+    /* 已闪满并停在终态：不再推进 */
     if(handle->u.simple.done) return;
 
-    isOn = handle->is_on();   // 获取执行器当前状态（1：动作态（亮），0：静止态（灭））
-
-    if(on_thd == 0 && off_thd == 0){
-        // 未设置阈值（0,0）：仅统计动作/静止节拍数，不改变执行器状态
-        if(1 == isOn){
-            FLASH_CNT_INC(handle->u.simple.on_cnt);
-        } else {
-            FLASH_CNT_INC(handle->u.simple.off_cnt);
+    /* ---- 补灭段：起步时正亮着、或闪满后要停在 ON，都先补一个完整 off_ms 的灭段 ---- */
+    if(handle->u.simple.gap){
+        if(isOn){                     /* 中途被外部点亮：重新灭掉，灭段从头算 */
+            handle->turn_off();
+            handle->u.simple.off_cnt = 0;
         }
-    } else if(0 == isOn){   // 执行器当前处于静止态
-        if(on_thd == 0){   // 动作阈值为0，则保持静止状态，不进入动作态
+
+        if(handle->u.simple.off_cnt < off_thd){
+            FLASH_CNT_INC(handle->u.simple.off_cnt);
+            return;
+        }
+
+        handle->u.simple.off_cnt = 0;
+        handle->u.simple.gap     = 0;
+        handle->turn_on();
+        handle->u.simple.flashed = 1;
+
+        if(handle->u.simple.finishOn){
+            handle->u.simple.done = 1;   /* 收尾：点亮后停住 */
+        }
+        return;
+    }
+
+    /* ---- 起步：按当前硬件状态决定先灭还是先亮 ---- */
+    if(0 == handle->u.simple.flashed){
+        handle->u.simple.off_cnt = 0;
+
+        if(0 == on_thd){                    /* 不进入动作态（常灭型）：硬件交给下面的亮/灭分支处理 */
+            handle->u.simple.flashed = 1;
+        } else if(isOn && 0 != off_thd){    /* 当前亮着：先灭，补一个完整灭段再开始闪 */
+            handle->turn_off();
+            handle->u.simple.gap = 1;
+        } else {                            /* 当前灭着：立即点亮开始闪 */
+            handle->turn_on();
+            handle->u.simple.flashed = 1;
+            handle->u.simple.on_cnt  = 0;
+        }
+        return;
+    }
+
+    if(0 == isOn){   /* 执行器当前处于静止态 */
+        if(on_thd == 0){   /* 动作阈值为0，则保持静止状态，不进入动作态 */
             FLASH_CNT_INC(handle->u.simple.off_cnt);
         } else if(handle->u.simple.off_cnt >= off_thd){
             handle->u.simple.off_cnt = 0;
-
-            if(0 == handle->u.simple.flashed){
-                /* 起始那段静止（或从外部点亮状态切回来后的第一段）：只是等待第一次亮，不计次 */
-                handle->u.simple.flashed = 1;
-                handle->turn_on();
-            } else {
-                /* 灭段走完：上一个“亮段 + 灭段”到此构成一次完整的闪烁，计数 +1 */
-                FLASH_CNT_INC(handle->u.simple.cycleCnt);
-
-                if(0 != handle->cycles && handle->u.simple.cycleCnt >= handle->cycles){
-                    handle->u.simple.done = 1;   // 闪满：此后不再推进
-
-                    /* 收尾：正常节拍此刻本该点亮，所以 ON 只是照常点亮后停住；
-                       OFF / KEEP 都不再点亮，直接停在熄灭
-                       （KEEP 与 stop 的口径不同，这里停在静止态而不是“留在点亮”） */
-                    if(FLASH_CTRL_STS_ON == handle->endState){
-                        handle->turn_on();
-                    }
-                } else {
-                    handle->turn_on();
-                }
-            }
+            handle->turn_on();   // 灭段走完，进入动作态
         } else {
             FLASH_CNT_INC(handle->u.simple.off_cnt);
         }
-    } else {   // 执行器当前处于动作态
-        if(0 == handle->u.simple.flashed){
-            handle->u.simple.flashed = 1;   // 已经在亮（例如在点亮状态下重设了参数）：这段亮就算第一次
-        }
-
-        if(off_thd == 0){   // 停止阈值为0，则保持动作状态，不进入静止态
+    } else {   /* 执行器当前处于动作态 */
+        if(off_thd == 0){   /* 停止阈值为0，则保持动作状态，不进入静止态 */
             FLASH_CNT_INC(handle->u.simple.on_cnt);
         } else if(handle->u.simple.on_cnt >= on_thd){
-            handle->u.simple.on_cnt  = 0;   // 亮段计时到，切回静止态（计数在灭段走完后才做）
+            /* 亮段走完：立刻切回静止态，并计一次闪烁 */
+            handle->u.simple.on_cnt  = 0;
             handle->u.simple.off_cnt = 0;
             handle->turn_off();
+            FLASH_CNT_INC(handle->u.simple.cycleCnt);
+
+            if(0 != handle->cycles && handle->u.simple.cycleCnt >= handle->cycles){
+                if(FLASH_CTRL_STS_ON == handle->endState){
+                    /* 收尾要点亮：先补一个完整灭段，否则最后一次亮会与收尾的亮连成一片 */
+                    handle->u.simple.gap      = 1;
+                    handle->u.simple.finishOn = 1;
+                } else {
+                    /* OFF / KEEP：亮段刚结束就已经灭好，直接停住 */
+                    handle->u.simple.done = 1;
+                }
+            }
         } else {
             FLASH_CNT_INC(handle->u.simple.on_cnt);
         }
