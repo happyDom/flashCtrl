@@ -265,10 +265,9 @@ static void flashCtrl_toggle(FlashCtrl* handle) {
             handle->u.simple.off_cnt = 0;
         }
 
-        if(handle->u.simple.off_cnt < off_thd){
-            FLASH_CNT_INC(handle->u.simple.off_cnt);
-            return;
-        }
+        /* 先计本拍，再判断是否走满：这样“补一个 off_ms”就是整 off_thd 拍，不多不少 */
+        FLASH_CNT_INC(handle->u.simple.off_cnt);
+        if(handle->u.simple.off_cnt < off_thd) return;
 
         handle->u.simple.off_cnt = 0;
         handle->u.simple.gap     = 0;
@@ -298,19 +297,25 @@ static void flashCtrl_toggle(FlashCtrl* handle) {
         return;
     }
 
-    if(0 == isOn){   /* 执行器当前处于静止态 */
-        if(on_thd == 0){   /* 动作阈值为0，则保持静止状态，不进入动作态 */
-            FLASH_CNT_INC(handle->u.simple.off_cnt);
-        } else if(handle->u.simple.off_cnt >= off_thd){
+    if(0 == isOn){   /* 执行器当前处于静止态：计本拍，走满 off_thd 拍就点亮 */
+        FLASH_CNT_INC(handle->u.simple.off_cnt);
+
+        if(0 != on_thd && handle->u.simple.off_cnt >= off_thd){
             handle->u.simple.off_cnt = 0;
             handle->turn_on();   // 灭段走完，进入动作态
-        } else {
-            FLASH_CNT_INC(handle->u.simple.off_cnt);
         }
-    } else {   /* 执行器当前处于动作态 */
-        if(off_thd == 0){   /* 停止阈值为0，则保持动作状态，不进入静止态 */
-            FLASH_CNT_INC(handle->u.simple.on_cnt);
-        } else if(handle->u.simple.on_cnt >= on_thd){
+    } else {   /* 执行器当前处于动作态：计本拍，走满 on_thd 拍就熄灭 */
+        FLASH_CNT_INC(handle->u.simple.on_cnt);
+
+        if(0 == on_thd){   /* 没有动作段（常灭型）：不计次，把执行器灭掉即可 */
+            handle->u.simple.on_cnt = 0;
+            if(0 != off_thd){
+                handle->turn_off();
+            }
+            return;
+        }
+
+        if(0 != off_thd && handle->u.simple.on_cnt >= on_thd){
             /* 亮段走完：立刻切回静止态，并计一次闪烁 */
             handle->u.simple.on_cnt  = 0;
             handle->u.simple.off_cnt = 0;
@@ -327,8 +332,6 @@ static void flashCtrl_toggle(FlashCtrl* handle) {
                     handle->u.simple.done = 1;
                 }
             }
-        } else {
-            FLASH_CNT_INC(handle->u.simple.on_cnt);
         }
     }
 }
@@ -482,20 +485,29 @@ static void langAdvance(FlashCtrl* handle) {
   */
 static void flashCtrl_toggleLang(FlashCtrl* handle) {
     uint8_t guard = 0;
+    uint8_t ticked = 0;   /* 本拍的“时间片”是否已经用于计时 */
 
     if(LANG_PH_OFF == handle->u.lang.phase) return;
 
     while(guard++ < 8){   // 防止 0 时长阶段形成死循环
         uint16_t dur = langDur(handle->u.lang.phase);
 
-        if(handle->u.lang.phaseCnt < dur){
-            FLASH_CNT_INC(handle->u.lang.phaseCnt);   // 本拍仍停在该阶段
-            return;
+        if(0 == dur){
+            // 0 时长阶段：同拍跳过，不占时间
+            langAdvance(handle);
+            if(LANG_PH_OFF == handle->u.lang.phase) return;
+            continue;
         }
 
-        // 本阶段到点：切换阶段（0 时长阶段会在同一拍内被跳过）
-        langAdvance(handle);
+        if(ticked) return;   // 本拍已用完，新阶段从下一拍开始计时
+
+        /* 先计本拍再判断：该阶段正好持续 dur 拍，切换发生在走满的那一拍 */
+        FLASH_CNT_INC(handle->u.lang.phaseCnt);
+        if(handle->u.lang.phaseCnt < dur) return;
+
+        langAdvance(handle);   // 本阶段到点，本拍切换（phaseCnt 由 langEnter 清零）
         if(LANG_PH_OFF == handle->u.lang.phase) return;
+        ticked = 1;
     }
 }
 
