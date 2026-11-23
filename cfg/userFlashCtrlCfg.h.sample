@@ -42,4 +42,11 @@
  * 不定义时表示不限定存储区（由编译器默认处理）。 */
 /* #define FLASH_CTRL_MEM_ATTR      xdata */
 
+/* 本库不需要任何临界区/关中断配置：
+ * 参数类接口（setThdMs / startLang / exitLangMode / reset / resetLangCycle /
+ * turnOn / turnOff / setLangCfgMs）只写"影子参数 + 一个单字节请求码"，
+ * 参数落库与端口动作全部在 flashCtrl_ticks() 里完成，
+ * 所以 ticks 放在定时器中断里、参数接口在主循环里调用也不用关中断。
+ * 代价是参数"下一拍生效"（最多晚一个调度周期）。 */
+
 #endif /* _USER_FLASH_CTRL_CFG_H_ */

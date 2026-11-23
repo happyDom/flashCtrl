@@ -33,9 +33,8 @@
  * 切回简单模式；简单模式的阈值存放在联合体外面，所以来回切换时阈值不会丢。
  */
 
-#define FLASH_CNT_MAX         0xFFFFu
-#define FLASH_CTRL_SLOT_SIZE  ((uint16_t)sizeof(FlashCtrl))
-#define FLASH_CTRL_POOL_SIZE  ((uint16_t)(FLASH_CTRL_ACTUATOR_NUM * FLASH_CTRL_SLOT_SIZE))
+#define FLASH_CNT_MAX                0xFFFFu
+#define FLASH_CTRL_LANG_STS_UNKNOWN  0xFFu   /* 灯语状态缓存"未知"：强制下一次写端口 */
 
 /* 节拍计数（饱和处理，防止长时间运行后回绕） */
 #define FLASH_CNT_INC(cnt)    do { if((cnt) < FLASH_CNT_MAX) (cnt)++; } while(0)
@@ -58,17 +57,24 @@ static uint16_t gLangLongOn;
 static uint16_t gLangShortOn;
 static uint16_t gLangGapOff;    /* 闪烁之间的熄灭（长亮之间、短亮之间、两组之间共用） */
 static uint16_t gLangLeadOff;   /* 首尾熄灭（触发时的起始熄灭、一轮结束的收尾熄灭共用） */
+
+/* 全局时长同样走"请求 + 影子"：主循环只写影子，由 ticks 落库 */
+static volatile uint16_t gLangPend[4];   /* 待应用：longOn / shortOn / gapOff / leadOff（毫秒） */
+static volatile uint8_t gLangCfgReq; /* 0：无；bit7：影子写入中；SET_LANG_MS：待应用 */
 #endif
 
-/* 静态内存池：以 uint8_t 数组申请固定大小的内存（静态存储区），
- * 同时用联合体引入一个句柄成员，保证池首地址满足 FlashCtrl 的对齐要求。 */
-typedef union {
-    uint8_t   bytes[FLASH_CTRL_POOL_SIZE];   /* 按字节划分的内存池 */
-    FlashCtrl alignUnit;                     /* 仅用于对齐，不参与使用 */
-} FlashCtrlPool_t;
-
-static FlashCtrlPool_t FLASH_CTRL_MEM_ATTR flashPool;   /* 静态内存池 */
+/* 静态内存池：直接声明成 FlashCtrl 数组。
+ * 好处：类型正确（不再把 uint8_t 数组强转成结构体访问，绕开严格别名问题）、
+ *       对齐由编译器保证、sizeof 与 stride 天然一致，
+ *       而且调试器里可以直接看每个句柄的成员，不必自己算偏移。 */
+static FlashCtrl FLASH_CTRL_MEM_ATTR flashPool[FLASH_CTRL_ACTUATOR_NUM];
 static FlashCtrl* head_handle;                          /* 调度链表头 */
+
+/* 池是否已做过"首次清零"。
+ * 不依赖启动代码把 RAM 清 0：池若被指定到不清零的区域（noinit / pdata / 备份区），
+ * inUse 与 pendingReq 的初值是垃圾，会被误判成"槽位已占用"（init 永远返回 0），
+ * 或者让 serviceRequests 去处理垃圾请求。 */
+static uint8_t poolInited;
 
 /* ---- 空对象：句柄内永远存放“可调用”的函数 ----------------------------------------------
  * 函数指针与通用指针宽度不保证一致（C251 上 code 指针 2 字节、通用空指针 3 字节），
@@ -77,19 +83,46 @@ static FlashCtrl* head_handle;                          /* 调度链表头 */
  *   2) 调用方依旧可以传 0（空指针，见 flashCtrl_init），由 init 统一替换为空实现。 */
 static void    flashCtrl_noOp(void)    { }                /* 空动作：什么也不做 */
 
-/* ---- 请求码：调用方只写两个单字节，链表操作一律在 ticks 上下文里完成 ---- */
+/* ---- 请求码：调用方只写单个单字节，链表操作一律在 ticks 上下文里完成 ---- */
 #define FLASH_REQ_NONE      0u
 #define FLASH_REQ_START     1u
 #define FLASH_REQ_STOP      2u
+
+/* ---- 参数请求码（与启停分开一个字节，保证"先配参数再 start"两次提交都生效）----
+ * 调用方（主循环）只写影子参数 + 这唯一一个单字节；参数落库、以及所有对执行器
+ * 端口的写，全部由 ticks 在自己的上下文里完成。因此本库不需要临界区，也不依赖
+ * 任何硬件（不用关中断）。
+ * 位 7 是"影子正在写"标志：调用方先把它置起来、写完影子再写真正的命令码；
+ * ticks 见到位 7、或拷贝影子前后两次读到的命令码不一致，就跳过这一拍、下一拍重来。
+ * 单字节写在 8051 上也是原子的，所以这套 seqlock 式握手不需要互斥。 */
+#define FLASH_CFG_NONE             0x00u
+#define FLASH_CFG_BUSY             0x80u    /* 影子写入中 */
+#define FLASH_CFG_SET_SIMPLE       0x01u    /* 简单模式参数 */
+#define FLASH_CFG_START_LANG       0x02u    /* 触发灯语 */
+#define FLASH_CFG_EXIT_LANG        0x03u    /* 退出灯语 */
+#define FLASH_CFG_RESET            0x04u    /* 清进度 */
+#define FLASH_CFG_RESET_LANG_CYCLE 0x05u    /* 清灯语轮数 */
+#define FLASH_CFG_SET_LANG_MS      0x06u    /* 全局灯语时长（走 gLangCfgReq） */
 
 static void clearProgress(FlashCtrl* handle);
 static void doStart(FlashCtrl* handle);
 static void doStop(FlashCtrl* handle, flashCtrlState_t offState);
 static void serviceRequests(void);
 
-/* 取池中第 idx 个槽位的地址 */
-static FlashCtrl* slotPtr(uint16_t idx) {
-    return (FlashCtrl*)(void*)&flashPool.bytes[(uint16_t)(idx * FLASH_CTRL_SLOT_SIZE)];
+/* 池首次使用前把"占用标志 + 挂起请求"清干净，不依赖 RAM 初值 */
+static void ensurePoolInited(void) {
+    uint16_t i;
+
+    if(poolInited) return;
+
+    for(i = 0; i < (uint16_t)FLASH_CTRL_ACTUATOR_NUM; i++){
+        flashPool[i].inUse      = 0;
+        flashPool[i].pendingReq = FLASH_REQ_NONE;
+        flashPool[i].cfgReq     = FLASH_CFG_NONE;
+        flashPool[i].phaseFresh = 0;
+    }
+
+    poolInited = 1;
 }
 
 /**
@@ -105,8 +138,10 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_is_on_
 
     if(!is_on) return 0;    // 状态读取函数是必须的
 
+    ensurePoolInited();
+
     for(i = 0; i < (uint16_t)FLASH_CTRL_ACTUATOR_NUM; i++){
-        handle = slotPtr(i);
+        handle = &flashPool[i];
         if(0 == handle->inUse){
             // 显式逐项初始化，不依赖 memset
             /* 空函数指针一律用“空实现”兜底：调用方可以传空指针，句柄内不会留下空指针。
@@ -143,7 +178,7 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_is_on_
             handle->u.lang.longDone   = 0;
             handle->u.lang.shortDone  = 0;
             handle->u.lang.phase      = LANG_PH_OFF;
-            handle->u.lang.isOn       = 0;
+            handle->u.lang.isOn       = FLASH_CTRL_LANG_STS_UNKNOWN;   /* 未知：第一次驱动一定写端口 */
 #endif
             return handle;
         }
@@ -164,13 +199,26 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_is_on_
   */
 void flashCtrl_setThdMs(FlashCtrl* handle, uint16_t on_ms, uint16_t off_ms,
                         uint16_t cycles, flashCtrlState_t endState) {
-    if(0 == handle) return;
+    if(0 == handle || 0 == handle->inUse) return;
 
-    handle->mode    = FLASH_CTRL_MODE_SIMPLE;
+    /* 只写影子参数 + 一个单字节提交，不碰 ticks 正在读的任何字段 */
+    handle->cfgReq = FLASH_CFG_BUSY;
+
+    handle->cfg.simple.on_ms    = on_ms;
+    handle->cfg.simple.off_ms   = off_ms;
+    handle->cfg.simple.cycles   = cycles;
+    handle->cfg.simple.endState = (uint8_t)endState;
+
+    handle->cfgReq = FLASH_CFG_SET_SIMPLE;   /* 单字节写即"提交" */
+}
+
+/* 参数落库：只在 ticks 里执行 */
+static void applySimple(FlashCtrl* handle, uint16_t on_ms, uint16_t off_ms,
+                        uint16_t cycles, uint8_t endState) {
     handle->on_thd  = FLASH_CTRL_CNT_OF_MS(on_ms);
     handle->off_thd = FLASH_CTRL_CNT_OF_MS(off_ms);
     handle->cycles  = cycles;
-    handle->endState = (uint8_t)endState;
+    handle->endState = endState;
 
     handle->u.simple.on_cnt   = 0;
     handle->u.simple.off_cnt  = 0;
@@ -179,6 +227,9 @@ void flashCtrl_setThdMs(FlashCtrl* handle, uint16_t on_ms, uint16_t off_ms,
     handle->u.simple.gap      = 0;
     handle->u.simple.finishOn = 0;
     handle->u.simple.done     = 0;
+
+    /* 模式最后写：先让进度数据落到"简单模式"的样子，再按简单模式解释 */
+    handle->mode = FLASH_CTRL_MODE_SIMPLE;
 }
 
 /**
@@ -235,9 +286,9 @@ static void clearProgress(FlashCtrl* handle) {
   * @retval None
   */
 void flashCtrl_reset(FlashCtrl* handle) {
-    if(0 == handle) return;
+    if(0 == handle || 0 == handle->inUse) return;
 
-    clearProgress(handle);
+    handle->cfgReq = FLASH_CFG_RESET;   /* 单字节提交，由 ticks 下一拍清进度 */
 }
 
 /**
@@ -251,12 +302,18 @@ void flashCtrl_reset(FlashCtrl* handle) {
   * @retval None
   */
 static void flashCtrl_toggle(FlashCtrl* handle) {
-    uint8_t  isOn = handle->is_on();   // 执行器当前状态（1：动作态/亮，0：静止态/灭）
-    uint16_t on_thd  = handle->on_thd;
-    uint16_t off_thd = handle->off_thd;
+    uint8_t  isOn;                     // 执行器当前状态（1：动作态/亮，0：静止态/灭）
+    uint16_t on_thd;
+    uint16_t off_thd;
 
-    /* 已闪满并停在终态：不再推进 */
+    /* 已闪满并停在终态：先返回，不调 is_on。
+     * 闪满的句柄会一直留在链表里，若每拍还调一次 is_on，遇到 is_on 带副作用的场合
+     * （清标志、软件消抖、ADC 采样）就是白白浪费，甚至误动作。 */
     if(handle->u.simple.done) return;
+
+    isOn    = handle->is_on();
+    on_thd  = handle->on_thd;
+    off_thd = handle->off_thd;
 
     /* ---- 补灭段：起步时正亮着、或闪满后要停在 ON，都先补一个完整 off_ms 的灭段 ---- */
     if(handle->u.simple.gap){
@@ -284,17 +341,19 @@ static void flashCtrl_toggle(FlashCtrl* handle) {
     if(0 == handle->u.simple.flashed){
         handle->u.simple.off_cnt = 0;
 
-        if(0 == on_thd){                    /* 不进入动作态（常灭型）：硬件交给下面的亮/灭分支处理 */
+        if(0 == on_thd){                    /* 不进入动作态（常灭型）：不占这一拍，
+                                             * 直接落到下面的亮/灭判据里（turnOff 当拍就能灭） */
             handle->u.simple.flashed = 1;
         } else if(isOn && 0 != off_thd){    /* 当前亮着：先灭，补一个完整灭段再开始闪 */
             handle->turn_off();
             handle->u.simple.gap = 1;
+            return;
         } else {                            /* 当前灭着：立即点亮开始闪 */
             handle->turn_on();
             handle->u.simple.flashed = 1;
             handle->u.simple.on_cnt  = 0;
+            return;
         }
-        return;
     }
 
     if(0 == isOn){   /* 执行器当前处于静止态：计本拍，走满 off_thd 拍就点亮 */
@@ -344,6 +403,8 @@ static void flashCtrl_toggle(FlashCtrl* handle) {
   * @retval None
   */
 static void langDrive(FlashCtrl* handle, uint8_t isOn) {
+    /* 缓存为"未知"(0xFF) 时一定写一次端口：上电初值、外部直接改过端口、
+     * stop 指定末态后又重新 start 的情况，都靠这一步重新同步硬件 */
     if(handle->u.lang.isOn == isOn) return;   // 避免每拍重复写端口
 
     if(1 == isOn){
@@ -487,7 +548,18 @@ static void flashCtrl_toggleLang(FlashCtrl* handle) {
     uint8_t guard = 0;
     uint8_t ticked = 0;   /* 本拍的“时间片”是否已经用于计时 */
 
-    if(LANG_PH_OFF == handle->u.lang.phase) return;
+    if(LANG_PH_OFF == handle->u.lang.phase){
+        handle->phaseFresh = 0;
+        return;
+    }
+
+    /* 本次相位是由参数请求在"本拍开头"落库并驱动端口的（见 applyLangStart / doStart），
+     * 点亮与计时要占同一拍的话，每段都会比设定短一拍。这里把本拍的时间片当作
+     * 已经用在"进入相位"上了：0 时长阶段照样在同一拍内跳过去，正常阶段从下一拍开始计时。 */
+    if(handle->phaseFresh){
+        handle->phaseFresh = 0;
+        ticked = 1;
+    }
 
     while(guard++ < 8){   // 防止 0 时长阶段形成死循环
         uint16_t dur = langDur(handle->u.lang.phase);
@@ -520,10 +592,36 @@ static void flashCtrl_toggleLang(FlashCtrl* handle) {
   * @retval None
   */
 void flashCtrl_setLangCfgMs(uint16_t longOnMs, uint16_t shortOnMs, uint16_t gapOffMs, uint16_t leadOffMs) {
-    gLangLongOn  = FLASH_CTRL_CNT_OF_MS(longOnMs);
-    gLangShortOn = FLASH_CTRL_CNT_OF_MS(shortOnMs);
-    gLangGapOff  = FLASH_CTRL_CNT_OF_MS(gapOffMs);
-    gLangLeadOff = FLASH_CTRL_CNT_OF_MS(leadOffMs);
+    /* 与句柄参数同一套办法：只写全局影子，由 ticks 落库 */
+    gLangCfgReq = FLASH_CFG_BUSY;
+
+    gLangPend[0] = longOnMs;
+    gLangPend[1] = shortOnMs;
+    gLangPend[2] = gapOffMs;
+    gLangPend[3] = leadOffMs;
+
+    gLangCfgReq = FLASH_CFG_SET_LANG_MS;
+}
+
+/* 全局灯语时长落库：只在 ticks 里执行 */
+static void langCfgApply(void) {
+    uint16_t a, b, c, d;
+
+    if(FLASH_CFG_SET_LANG_MS != gLangCfgReq) return;
+
+    a = gLangPend[0];
+    b = gLangPend[1];
+    c = gLangPend[2];
+    d = gLangPend[3];
+
+    if(FLASH_CFG_SET_LANG_MS != gLangCfgReq) return;   /* 拷贝期间被改写：下一拍重来 */
+
+    gLangCfgReq = FLASH_CFG_NONE;
+
+    gLangLongOn  = FLASH_CTRL_CNT_OF_MS(a);
+    gLangShortOn = FLASH_CTRL_CNT_OF_MS(b);
+    gLangGapOff  = FLASH_CTRL_CNT_OF_MS(c);
+    gLangLeadOff = FLASH_CTRL_CNT_OF_MS(d);
 }
 
 /**
@@ -537,7 +635,49 @@ void flashCtrl_setLangCfgMs(uint16_t longOnMs, uint16_t shortOnMs, uint16_t gapO
 void flashCtrl_startLang(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOfShort, uint8_t cycles) {
     if(0 == handle || 0 == handle->inUse) return;
 
-    handle->mode = FLASH_CTRL_MODE_LANG;
+    /* 只写影子 + 一个单字节提交；灯语的一切判断与端口动作都在 ticks 里做 */
+    handle->cfgReq = FLASH_CFG_BUSY;
+
+    handle->cfg.lang.longTotal  = timesOfLong;
+    handle->cfg.lang.shortTotal = timesOfShort;
+    handle->cfg.lang.cycles     = cycles;
+
+    handle->cfgReq = FLASH_CFG_START_LANG;
+}
+
+/* 灯语触发落库：只在 ticks 里执行 */
+static void applyLangStart(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOfShort, uint8_t cycles) {
+    /* 取消灯语：两个次数都为 0。此时不碰联合体、也不改模式，
+     * 免得把正在跑的简单模式进度清掉。 */
+    if(0 == timesOfLong && 0 == timesOfShort){
+        if(FLASH_CTRL_MODE_LANG == handle->mode){
+            handle->u.lang.phase      = LANG_PH_OFF;
+            handle->u.lang.phaseCnt   = 0;
+            handle->u.lang.longTotal  = 0;
+            handle->u.lang.shortTotal = 0;
+            handle->u.lang.cycles     = 0;
+            handle->u.lang.longDone   = 0;
+            handle->u.lang.shortDone  = 0;
+        }
+        return;
+    }
+
+    /* 防呆：四段时长一次都没配过（全 0）时，所有阶段都是 0 拍，ticks 会在当拍
+     * 把它们全部跳过并立刻"跑满轮数"→ isLangDone 返回 1，而灯一下都不亮。
+     * 应用层据此以为这个错误码已经报完，故障指示等于丢了。这里按"取消灯语"处理。 */
+    if(0 == gLangLongOn && 0 == gLangShortOn && 0 == gLangGapOff && 0 == gLangLeadOff){
+        if(FLASH_CTRL_MODE_LANG == handle->mode){
+            handle->u.lang.phase      = LANG_PH_OFF;
+            handle->u.lang.phaseCnt   = 0;
+            handle->u.lang.longTotal  = 0;
+            handle->u.lang.shortTotal = 0;
+            handle->u.lang.cycles     = 0;
+            handle->u.lang.longDone   = 0;
+            handle->u.lang.shortDone  = 0;
+            handle->u.lang.cycleCnt   = 0;
+        }
+        return;
+    }
 
     handle->u.lang.longTotal  = timesOfLong;
     handle->u.lang.shortTotal = timesOfShort;
@@ -548,16 +688,16 @@ void flashCtrl_startLang(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOf
     handle->u.lang.phaseCnt   = 0;
     handle->u.lang.isOn       = handle->is_on();     /* 状态读取函数由 init 保证有效（空实现返回 0） */
 
-    if(0 == timesOfLong && 0 == timesOfShort){
-        handle->u.lang.phase = LANG_PH_OFF;   // 取消灯语，不动执行器
-        return;
-    }
-
     if(1 == handle->u.lang.isOn && gLangLeadOff > 0){
         langEnter(handle, LANG_PH_START_OFF);   // 正亮着：先灭一下再开始
     } else {
         langEnter(handle, langFirstOnPhase(handle));   // 本就熄灭：不额外延长熄灭周期
     }
+
+    /* 模式最后写：先让相位数据准备好，再按灯语解释（doStart 会据此重驱动端口） */
+    handle->mode = FLASH_CTRL_MODE_LANG;
+
+    handle->phaseFresh = 1;   /* 第一段端口是本拍驱动的，本拍不再重复计时 */
 }
 
 /**
@@ -569,8 +709,11 @@ void flashCtrl_startLang(FlashCtrl* handle, uint8_t timesOfLong, uint8_t timesOf
 void flashCtrl_exitLangMode(FlashCtrl* handle) {
     if(0 == handle || 0 == handle->inUse) return;
 
-    handle->mode = FLASH_CTRL_MODE_SIMPLE;
+    handle->cfgReq = FLASH_CFG_EXIT_LANG;   /* 单字节提交，下一拍生效 */
+}
 
+/* 退出灯语落库：只在 ticks 里执行 */
+static void applyLangExit(FlashCtrl* handle) {
     handle->u.lang.phase    = LANG_PH_OFF;
     handle->u.lang.phaseCnt = 0;
     handle->u.lang.cycleCnt = 0;
@@ -579,12 +722,20 @@ void flashCtrl_exitLangMode(FlashCtrl* handle) {
     handle->u.lang.cycles     = 0;
     handle->u.lang.longDone   = 0;
     handle->u.lang.shortDone  = 0;
-    handle->u.lang.isOn       = 0;
+    handle->u.lang.isOn       = FLASH_CTRL_LANG_STS_UNKNOWN;
 
+    /* 灯语与简单模式共用同一块内存：简单模式的进度逐项显式清零，
+     * 不能指望"上面写的灯语字段刚好覆盖成 0"——布局一变就会漏掉某个标志。 */
     handle->u.simple.on_cnt   = 0;
     handle->u.simple.off_cnt  = 0;
     handle->u.simple.cycleCnt = 0;
-    handle->u.simple.done     = 0;   /* 灯语与简单模式共用这块内存，进度全部清零后再回简单模式 */
+    handle->u.simple.flashed  = 0;
+    handle->u.simple.gap      = 0;
+    handle->u.simple.finishOn = 0;
+    handle->u.simple.done     = 0;
+
+    /* 模式最后写：先按简单模式的口径把进度准备好再切 */
+    handle->mode = FLASH_CTRL_MODE_SIMPLE;
 }
 
 /**
@@ -594,7 +745,8 @@ void flashCtrl_exitLangMode(FlashCtrl* handle) {
   *         0：还在跑，或 cycles 传了 0（无限重复），或当前不在灯语模式
   */
 uint8_t flashCtrl_isLangDone(FlashCtrl* handle) {
-    if(0 == handle || FLASH_CTRL_MODE_LANG != handle->mode) return 0;
+    if(0 == handle || 0 == handle->inUse) return 0;
+    if(FLASH_CTRL_MODE_LANG != handle->mode) return 0;
     if(0 == handle->u.lang.cycles) return 0;   // 无限重复，不存在“跑完”
 
     return (handle->u.lang.cycleCnt >= handle->u.lang.cycles) ? 1 : 0;
@@ -606,7 +758,8 @@ uint8_t flashCtrl_isLangDone(FlashCtrl* handle) {
   * @retval 已完成的整轮数（65535 封顶）；非灯语模式返回 0
   */
 uint16_t flashCtrl_getLangCycle(FlashCtrl* handle) {
-    if(0 == handle || FLASH_CTRL_MODE_LANG != handle->mode) return 0;
+    if(0 == handle || 0 == handle->inUse) return 0;
+    if(FLASH_CTRL_MODE_LANG != handle->mode) return 0;
 
     return handle->u.lang.cycleCnt;
 }
@@ -617,7 +770,20 @@ uint16_t flashCtrl_getLangCycle(FlashCtrl* handle) {
   * @retval None
   */
 void flashCtrl_resetLangCycle(FlashCtrl* handle) {
-    if(0 == handle || FLASH_CTRL_MODE_LANG != handle->mode) return;
+    if(0 == handle || 0 == handle->inUse) return;
+
+    handle->cfgReq = FLASH_CFG_RESET_LANG_CYCLE;   /* 单字节提交，下一拍生效 */
+}
+
+/* 清灯语轮数落库：只在 ticks 里执行 */
+static void applyResetLangCycle(FlashCtrl* handle) {
+    if(FLASH_CTRL_MODE_LANG != handle->mode) return;
+
+    /* 灯语已经跑满、停在空闲相位（LANG_PH_OFF）时不能再清轮数：
+     * 清成 0 后 isLangDone 永久返回 0，而 phase 是 OFF、ticks 不再推进，
+     * 轮数也永远涨不回来 —— 轮询 isLangDone 的应用层会一直卡在这里。
+     * 想重新计次请直接再调一次 flashCtrl_startLang，它自己会把轮数清零并从头跑。 */
+    if(LANG_PH_OFF == handle->u.lang.phase) return;
 
     handle->u.lang.cycleCnt = 0;
 }
@@ -626,7 +792,7 @@ void flashCtrl_resetLangCycle(FlashCtrl* handle) {
 /**
   * @brief  启动闪烁控制，把句柄加入工作链表。
   * @param  handle: 闪烁控制句柄
-  * @retval 0：成功；-1：句柄非法或已在链表中
+  * @retval 0：请求已受理（重复提交无害，已在链表中的会被忽略）；-1：句柄非法（空指针或未分配）
   */
 int flashCtrl_start(FlashCtrl* handle) {
     if(0 == handle || 0 == handle->inUse) return -1;   // 入口判空：调用方可能传空指针
@@ -638,10 +804,28 @@ int flashCtrl_start(FlashCtrl* handle) {
 /* 实际的挂链动作：只在 flashCtrl_ticks() -> serviceRequests() 里执行 */
 static void doStart(FlashCtrl* handle) {
     FlashCtrl* target;
+    uint16_t   n;
 
-    for(target = head_handle; target; target = target->next){
+    /* 遍历带槽位上界：即使某个句柄的 next 被写坏成自环，
+     * 也不会在 ticks（可能是中断）里转成死循环 */
+    for(n = 0, target = head_handle; target && n < (uint16_t)FLASH_CTRL_ACTUATOR_NUM;
+        n++, target = target->next){
         if(target == handle) return;   // 已在链表中：重复请求忽略
     }
+
+#if FLASH_CTRL_LANG_EN
+    /* 灯语不读 is_on、只靠相位推进，所以重新挂链时必须自己把端口驱动到相位该有的状态；
+     * 并且从头报一遍 —— 停过一次之后接着报"半截错误码"没有意义，
+     * 否则恢复后可能剩半段不亮（该亮的段因为"相位没变、缓存也没变"而没人写端口）。 */
+    if(FLASH_CTRL_MODE_LANG == handle->mode && LANG_PH_OFF != handle->u.lang.phase){
+        handle->u.lang.phaseCnt   = 0;
+        handle->u.lang.longDone   = 0;
+        handle->u.lang.shortDone  = 0;
+        handle->u.lang.cycleCnt   = 0;
+        langEnter(handle, langFirstOnPhase(handle));
+        handle->phaseFresh = 1;   /* 同上：端口是本拍驱动的，本拍不再重复计时 */
+    }
+#endif
 
     handle->next = head_handle;
     head_handle  = handle;
@@ -688,8 +872,9 @@ void flashCtrl_turnOff(FlashCtrl* handle) {
 /* 实际的摘链 + 末态处理：只在 flashCtrl_ticks() -> serviceRequests() 里执行 */
 static void doStop(FlashCtrl* handle, flashCtrlState_t offState) {
     FlashCtrl** curr;
+    uint16_t    n;
 
-    for(curr = &head_handle; *curr; ){
+    for(n = 0, curr = &head_handle; *curr && n < (uint16_t)FLASH_CTRL_ACTUATOR_NUM; n++){
         if(*curr == handle){
             *curr        = (*curr)->next;
             handle->next = 0;
@@ -702,11 +887,18 @@ static void doStop(FlashCtrl* handle, flashCtrlState_t offState) {
     switch(offState){
     case FLASH_CTRL_STS_ON:
         handle->turn_on();
+#if FLASH_CTRL_LANG_EN
+        /* 这里绕过了 langDrive，必须自己把灯语的状态缓存同步成末态 */
+        if(FLASH_CTRL_MODE_LANG == handle->mode) handle->u.lang.isOn = 1;
+#endif
         clearProgress(handle);
         break;
 
     case FLASH_CTRL_STS_OFF:
         handle->turn_off();
+#if FLASH_CTRL_LANG_EN
+        if(FLASH_CTRL_MODE_LANG == handle->mode) handle->u.lang.isOn = 0;
+#endif
         clearProgress(handle);
         break;
 
@@ -724,14 +916,16 @@ static void doStop(FlashCtrl* handle, flashCtrlState_t offState) {
   */
 void flashCtrl_ticks(void) {
     FlashCtrl* target;
+    uint16_t   n;
 
     /* 1) 先把主循环提交的启动/停止请求执行掉：
        链表只在这里被改动，因此调用方不必自己做临界区，也不存在
        “ticks 正在遍历、主循环同时摘链”的竞争 */
     serviceRequests();
 
-    /* 2) 再推进所有已挂链句柄的节拍 */
-    for(target = head_handle; target; target = target->next){
+    /* 2) 再推进所有已挂链句柄的节拍（同样加槽位上界，防 next 被写坏时死循环） */
+    for(n = 0, target = head_handle; target && n < (uint16_t)FLASH_CTRL_ACTUATOR_NUM;
+        n++, target = target->next){
 #if FLASH_CTRL_LANG_EN
         if(FLASH_CTRL_MODE_LANG == target->mode){
             flashCtrl_toggleLang(target);
@@ -743,6 +937,63 @@ void flashCtrl_ticks(void) {
     }
 }
 
+/* 参数请求处理：拷贝影子 → 复核命令码 → 认领 → 落库。
+ * 拷贝前后都读一次 cfgReq，只要变了（说明调用方正在写新的影子）就放弃这一拍，
+ * 下一拍重来；已经落库的数据全部来自本地副本，不会再被调用方改写。
+ * 本函数只在 ticks 上下文里跑，调用方（主循环）同时可以随便写影子。 */
+static void serviceCfg(FlashCtrl* handle) {
+    uint8_t  code;
+    uint16_t a, b, c;
+    uint8_t  d;
+
+    if(0 == handle->inUse) return;
+
+    code = handle->cfgReq;
+    if(FLASH_CFG_NONE == code || (FLASH_CFG_BUSY & code)) return;
+
+    switch(code){
+    case FLASH_CFG_SET_SIMPLE:
+        a = handle->cfg.simple.on_ms;
+        b = handle->cfg.simple.off_ms;
+        c = handle->cfg.simple.cycles;
+        d = handle->cfg.simple.endState;
+        if(code != handle->cfgReq) return;
+        handle->cfgReq = FLASH_CFG_NONE;
+        applySimple(handle, a, b, c, d);
+        break;
+
+#if FLASH_CTRL_LANG_EN
+    case FLASH_CFG_START_LANG:
+        a = (uint16_t)handle->cfg.lang.longTotal;
+        b = (uint16_t)handle->cfg.lang.shortTotal;
+        c = (uint16_t)handle->cfg.lang.cycles;
+        if(code != handle->cfgReq) return;
+        handle->cfgReq = FLASH_CFG_NONE;
+        applyLangStart(handle, (uint8_t)a, (uint8_t)b, (uint8_t)c);
+        break;
+
+    case FLASH_CFG_EXIT_LANG:
+        handle->cfgReq = FLASH_CFG_NONE;
+        applyLangExit(handle);
+        break;
+
+    case FLASH_CFG_RESET_LANG_CYCLE:
+        handle->cfgReq = FLASH_CFG_NONE;
+        applyResetLangCycle(handle);
+        break;
+#endif
+
+    case FLASH_CFG_RESET:
+        handle->cfgReq = FLASH_CFG_NONE;
+        clearProgress(handle);
+        break;
+
+    default:                            /* 未知码：丢弃，免得卡在同一个值上 */
+        handle->cfgReq = FLASH_CFG_NONE;
+        break;
+    }
+}
+
 /* 请求处理：逐槽位读取 pendingReq（单字节读，不会读到“半个指针”）。
  * 因链表操作全部收在本函数里，本函数与调用方必须同上下文（即 ticks 所在的中断/主循环），
  * 与调用方提交请求的上下文可以不同。 */
@@ -751,13 +1002,31 @@ static void serviceRequests(void) {
     FlashCtrl* h;
     uint8_t req, off;
 
+    ensurePoolInited();
+
+#if FLASH_CTRL_LANG_EN
+    /* 灯语全局时长先落库：这样"同一拍里先 setLangCfgMs 再 startLang"用的是新时长 */
+    langCfgApply();
+#endif
+
     for(i = 0; i < (uint16_t)FLASH_CTRL_ACTUATOR_NUM; i++){
-        h   = slotPtr(i);
+        h = &flashPool[i];
+
+        /* 顺序：先落参数、再处理启停 —— 这样"setThdMs + start"同拍提交时，
+         * 挂链那一刻用的已经是新参数 */
+        serviceCfg(h);
+
         req = h->pendingReq;
         if(FLASH_REQ_NONE == req) continue;
 
-        if(0 == h->inUse){                     /* 槽位空闲（未分配）：丢弃残留请求 */
-            h->pendingReq = FLASH_REQ_NONE;
+        /* 先认领（清掉）再执行：
+         * 执行期间调用方若又提交了一个请求，会写回 pendingReq、留到下一拍；
+         * 反过来"执行完再比较值是否相同"的写法，会把执行期间提交的同值请求
+         * （例如两次 stop 只是末态参数不同）当成"本次已处理"而静默丢弃，
+         * 结果执行器停在旧的末态。 */
+        h->pendingReq = FLASH_REQ_NONE;
+
+        if(0 == h->inUse){                     /* 槽位空闲（未分配）：请求已丢弃 */
             continue;
         }
 
@@ -767,8 +1036,5 @@ static void serviceRequests(void) {
         case FLASH_REQ_STOP:   doStop(h, (flashCtrlState_t)off);      break;
         default:                                                      break;
         }
-
-        /* 执行期间若又提交了新请求（值不同）则保留到下一拍；值相同视为本次已处理 */
-        if((uint8_t)req == h->pendingReq) h->pendingReq = FLASH_REQ_NONE;
     }
 }

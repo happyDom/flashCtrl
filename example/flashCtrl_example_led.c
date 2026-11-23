@@ -6,6 +6,10 @@
  * 示例等价于原来的 led0_toggle() 实现：库内只保留“闪烁”逻辑，
  * 具体的端口操作、状态读取全部由调用方（即本文件）注册进来；
  * 句柄由库内静态内存池分配，调用方只记录 flashCtrl_init 返回的指针。
+ *
+ * flashCtrl_ticks() 放在定时器中断里、而 setThdMs / startLang 等在主循环里调用也没问题：
+ * 参数类接口只写"影子参数 + 一个单字节请求码"，落库与端口动作都在 ticks 里完成，
+ * 不需要关中断（代价是参数下一拍生效，见 readMe「中断上下文与参数请求」一节）。
  */
 
 #include "flashCtrl.h"
@@ -37,13 +41,15 @@ static void buzzer_turn_off(void)   { BEEP_OFF(); }
 static uint8_t buzzer_is_on(void)  { return BEEP_ON_STS(); }
 
 void main(void){
-    led0 = flashCtrl_init(led0_turn_on, led0_turn_off, led0_is_on);   // 注册失败时返回 0（空指针），由调用方自行处理
+    led0 = flashCtrl_init(led0_turn_on, led0_turn_off, led0_is_on);   // 注册失败时返回 0（空指针）
+    if(0 == led0) { return; }                                        // 池满：调大 FLASH_CTRL_ACTUATOR_NUM
     /* 亮 50ms、灭 150ms（10ms 一拍下即 5 拍 / 15 拍）；cycles=0 一直闪、
        endState 只在有限次数时用得上（这里保持此刻状态） */
     flashCtrl_setThdMs(led0, 50, 150, 0, FLASH_CTRL_STS_KEEP);
     flashCtrl_start(led0);              // 提交启动请求，由 flashCtrl_ticks() 在下一拍挂链（异步）
 
     buzzer = flashCtrl_init(buzzer_turn_on, buzzer_turn_off, buzzer_is_on);
+    if(0 == buzzer) { return; }
     /* 鸣 20ms、停 280ms（10ms 一拍 → 2 拍 / 28 拍），同样无限次 */
     flashCtrl_setThdMs(buzzer, 20, 280, 0, FLASH_CTRL_STS_KEEP);
     flashCtrl_start(buzzer);            // 同上：请求式，下一拍生效
