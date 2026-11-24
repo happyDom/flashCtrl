@@ -161,6 +161,9 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_is_on_
             handle->on_thd  = 0;
             handle->off_thd = 0;
             handle->cycles  = 0;
+            /* 初始按“已经灭了很久”处理：上电就调用 setThdMs 时应立刻开始闪，
+               不必为一个从未发生过的亮段白等一个灭段 */
+            handle->offRun  = FLASH_CNT_MAX;
             handle->endState = FLASH_CTRL_STS_KEEP;
             handle->u.simple.on_cnt   = 0;
             handle->u.simple.off_cnt  = 0;
@@ -292,10 +295,28 @@ void flashCtrl_reset(FlashCtrl* handle) {
 }
 
 /**
+  * @brief  记录“连续灭了多少拍”（历史量，两种模式都要维护）：
+  *         亮着就清零，灭着就加一（饱和）。起步与灯语入口靠它判断
+  *         “上一段亮结束后，是否已经灭满一个完整灭段”。
+  *         例如 常亮 → turnOff 仅 1 拍 → setThdMs(...)，这一拍起算的灭态很短，
+  *         不能当成“本来就灭着”直接点亮，否则上一段常亮和第一次闪会连成一片。
+  * @param  handle: 闪烁控制句柄
+  * @param  isOn:   本次读到的执行器状态（1：动作态/亮，0：静止态/灭）
+  * @retval None
+  */
+static void trackOffRun(FlashCtrl* handle, uint8_t isOn) {
+    if(0 != isOn){
+        handle->offRun = 0;
+    } else if(handle->offRun < FLASH_CNT_MAX){
+        handle->offRun++;
+    }
+}
+
+/**
   * @brief  简单模式的节拍处理（库内私有）：等价于通用化后的 led0_toggle。
   *         起步与收尾都要考虑“前后状态的灭段连起来”，避免两个亮段首尾相接：
-  *           - 起步时当前是灭的 → 立即点亮开始闪；
-  *           - 起步时当前是亮的 → 先灭，补一个完整灭段（off_ms）再开始闪；
+  *           - 起步时上一段亮结束已经灭满 off_ms → 立即点亮开始闪；
+  *           - 起步时正亮着、或刚灭不久（没灭满 off_ms）→ 先把灭段补满再开始闪；
   *           - 闪满后要停在 ON  → 先补一个完整灭段，再点亮并停住；
   *           - 闪满后要停在 OFF → 亮段一结束就灭，直接停住。
   * @param  handle: 闪烁控制句柄
@@ -308,14 +329,23 @@ static void flashCtrl_toggle(FlashCtrl* handle) {
 
     /* 已闪满并停在终态：先返回，不调 is_on。
      * 闪满的句柄会一直留在链表里，若每拍还调一次 is_on，遇到 is_on 带副作用的场合
-     * （清标志、软件消抖、ADC 采样）就是白白浪费，甚至误动作。 */
-    if(handle->u.simple.done) return;
+     * （清标志、软件消抖、ADC 采样）就是白白浪费，甚至误动作。
+     * 但停灭期间仍要继续累计灭态时长（靠 finishOn 判断停的是亮还是灭），
+     * 否则停很久之后重新 setThdMs 会被误判成“刚灭”，白等一个完整灭段。 */
+    if(handle->u.simple.done){
+        if(0 == handle->u.simple.finishOn && handle->offRun < FLASH_CNT_MAX){
+            handle->offRun++;
+        }
+        return;
+    }
 
     isOn    = handle->is_on();
     on_thd  = handle->on_thd;
     off_thd = handle->off_thd;
 
-    /* ---- 补灭段：起步时正亮着、或闪满后要停在 ON，都先补一个完整 off_ms 的灭段 ---- */
+    trackOffRun(handle, isOn);
+
+    /* ---- 补灭段：起步时正亮着 / 刚灭不久、或闪满后要停在 ON，都先补满一个灭段 ---- */
     if(handle->u.simple.gap){
         if(isOn){                     /* 中途被外部点亮：重新灭掉，灭段从头算 */
             handle->turn_off();
@@ -337,18 +367,26 @@ static void flashCtrl_toggle(FlashCtrl* handle) {
         return;
     }
 
-    /* ---- 起步：按当前硬件状态决定先灭还是先亮 ---- */
+    /* ---- 起步：按当前状态与“已经灭了多久”决定先灭还是先亮 ---- */
     if(0 == handle->u.simple.flashed){
         handle->u.simple.off_cnt = 0;
 
         if(0 == on_thd){                    /* 不进入动作态（常灭型）：不占这一拍，
                                              * 直接落到下面的亮/灭判据里（turnOff 当拍就能灭） */
             handle->u.simple.flashed = 1;
-        } else if(isOn && 0 != off_thd){    /* 当前亮着：先灭，补一个完整灭段再开始闪 */
+        } else if(0 != off_thd && isOn){    /* 正亮着：先灭，补满一个完整灭段再开始闪 */
             handle->turn_off();
             handle->u.simple.gap = 1;
             return;
-        } else {                            /* 当前灭着：立即点亮开始闪 */
+        } else if(0 != off_thd && handle->offRun < off_thd){
+            /* 灭着，但上一段亮结束到现在还没灭满一个完整灭段
+             * （典型：常亮 → turnOff 只过了 1 拍就 setThdMs）：
+             * 把已经灭掉的那几拍算进来，接着补满 off_thd 拍再点亮，
+             * 免得上一段常亮和第一次闪之间只隔一两拍、看起来连成一片 */
+            handle->u.simple.off_cnt = handle->offRun;
+            handle->u.simple.gap     = 1;
+            return;
+        } else {                            /* 本来就灭够了：立即点亮开始闪 */
             handle->turn_on();
             handle->u.simple.flashed = 1;
             handle->u.simple.on_cnt  = 0;
@@ -540,6 +578,32 @@ static void langAdvance(FlashCtrl* handle) {
 }
 
 /**
+  * @brief  灯语：从第一段开始跑——正亮着、或刚灭不久（没灭满一个 leadOff）时先补起始熄灭，
+  *         本来就灭够了就直接进长亮组。与简单模式起步的“前后灭段连起来”同一口径。
+  *         同时置 phaseFresh：本拍的端口是本函数驱动的，这一拍不再重复计时。
+  * @param  handle: 闪烁控制句柄（u.lang.isOn 与 offRun 需已是最新读数）
+  * @retval None
+  */
+static void langBegin(FlashCtrl* handle) {
+    uint8_t wasOn = (1 == handle->u.lang.isOn) ? 1 : 0;   /* 先记下来：langEnter 会把缓存改成目标态 */
+
+    if(gLangLeadOff > 0 && (wasOn || handle->offRun < gLangLeadOff)){
+        langEnter(handle, LANG_PH_START_OFF);
+        if(0 == wasOn){
+            /* 灭着但还没灭满：已经灭掉的那几拍算进 leadOff，接着补剩下的。
+             * offRun 是“上一次 ticks 结束时”的值，而本拍（入口拍）已经灭着、
+             * 又因为 phaseFresh 不参与计时，所以这里 +1，把这本拍也补上，
+             * 保证从“亮段结束”到“下一次亮”整好是 leadOff 拍。 */
+            handle->u.lang.phaseCnt = (uint16_t)(handle->offRun + 1u);
+        }
+    } else {
+        langEnter(handle, langFirstOnPhase(handle));
+    }
+
+    handle->phaseFresh = 1;
+}
+
+/**
   * @brief  灯语模式的节拍处理（库内私有）。
   * @param  handle: 闪烁控制句柄
   * @retval None
@@ -547,6 +611,9 @@ static void langAdvance(FlashCtrl* handle) {
 static void flashCtrl_toggleLang(FlashCtrl* handle) {
     uint8_t guard = 0;
     uint8_t ticked = 0;   /* 本拍的“时间片”是否已经用于计时 */
+
+    /* 灯语不按 is_on 纠偏，但每拍读一次用于累计灭态时长（起始熄灭要靠它判断） */
+    trackOffRun(handle, handle->is_on());
 
     if(LANG_PH_OFF == handle->u.lang.phase){
         handle->phaseFresh = 0;
@@ -688,16 +755,12 @@ static void applyLangStart(FlashCtrl* handle, uint8_t timesOfLong, uint8_t times
     handle->u.lang.phaseCnt   = 0;
     handle->u.lang.isOn       = handle->is_on();     /* 状态读取函数由 init 保证有效（空实现返回 0） */
 
-    if(1 == handle->u.lang.isOn && gLangLeadOff > 0){
-        langEnter(handle, LANG_PH_START_OFF);   // 正亮着：先灭一下再开始
-    } else {
-        langEnter(handle, langFirstOnPhase(handle));   // 本就熄灭：不额外延长熄灭周期
-    }
-
-    /* 模式最后写：先让相位数据准备好，再按灯语解释（doStart 会据此重驱动端口） */
+    /* 模式先写：相位数据已就绪，后面按灯语解释（doStart 会据此重驱动端口） */
     handle->mode = FLASH_CTRL_MODE_LANG;
 
-    handle->phaseFresh = 1;   /* 第一段端口是本拍驱动的，本拍不再重复计时 */
+    /* 第一段：正亮着或刚灭不久 → 先补起始熄灭；本就灭够了 → 直接进长亮组。
+     * langBegin 内部会置 phaseFresh（本拍已驱动端口，不再重复计时）。 */
+    langBegin(handle);
 }
 
 /**
@@ -826,8 +889,10 @@ static void doStart(FlashCtrl* handle) {
         handle->u.lang.longDone   = 0;
         handle->u.lang.shortDone  = 0;
         handle->u.lang.cycleCnt   = 0;
-        langEnter(handle, langFirstOnPhase(handle));
-        handle->phaseFresh = 1;   /* 同上：端口是本拍驱动的，本拍不再重复计时 */
+        /* 从头报一遍，起始熄灭也要按“现在正亮着 / 刚灭不久”重新判断，
+         * 这与 startLang 用的是同一套入口（langBegin 内部会同步 isOn 基线） */
+        handle->u.lang.isOn = handle->is_on();
+        langBegin(handle);
     }
 #endif
 

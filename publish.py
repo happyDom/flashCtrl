@@ -727,7 +727,7 @@ def 打印Tags(入参: 命令行参数类 = None,
     gitVerInfo.GitVerInfo(入参.gitVerInfoCfg).打印Tags(画板=画板.副本.缩进())
 
 if __name__ == '__main__':
-    画板: 打印模板 = 打印模板(False)
+    画板: 打印模板 = 打印模板(True)
     画板.执行位置(__file__)
 
     画板.特殊字符宽度字典 = {'ī':2.5}

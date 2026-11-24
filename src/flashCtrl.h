@@ -38,7 +38,8 @@
  *     简单模式每一拍都靠它判断执行器当前状态，标志位一旦与硬件不一致（别的逻辑改了灯、
  *     上电初值不同、被外部强行拉低……）就会“跑飞”：该灭的时候不灭、该亮的时候不亮。
  *     灯语模式内部用句柄里的状态缓存，只在状态变化时写端口（缓存为"未知"时一定重写一次，
- *     覆盖上电初值、stop 指定末态后重新 start 等情况）；但灯语不会每拍读 is_on，
+ *     覆盖上电初值、stop 指定末态后重新 start 等情况）；灯语不会每拍按 is_on 纠偏，
+ *     只每拍读一次用于统计“已灭了多少拍”（见下面的 offRun）；
  *     所以外部代码在灯语运行期间直接改过端口的话，灯语本身察觉不到，
  *     需要重新 startLang 或 exitLangMode 才能重新同步。
  * 2、 节拍最好来自定时器中断（在中断里调 flashCtrl_ticks），别挂在长任务之后的主循环里：
@@ -155,6 +156,8 @@ typedef struct FlashCtrl {
     uint16_t     on_thd;    /* 简单模式：动作态节拍数，0：不动作（保持静止） */
     uint16_t     off_thd;   /* 简单模式：静止态节拍数，0：不停止（保持动作） */
     uint16_t     cycles;    /* 简单模式：需要闪烁的次数，0 表示一直闪下去（由 setThdMs 设置） */
+    uint16_t     offRun;    /* 连续处于静止态（灭）的节拍数：起步/灯语入口靠它判断“上一段亮结束后
+                               是否已经灭满一个完整灭段”。是历史量，跨 setThdMs、跨模式切换都保留 */
     uint8_t      endState;  /* 简单模式：闪满 cycles 次后的终态（flashCtrlState_t，由 setThdMs 设置） */
     uint8_t      mode;      /* flashCtrlMode_t，由库内维护 */
     uint8_t      inUse;     /* 内存池槽位占用标志，由库内维护，调用方不要改写 */
@@ -231,8 +234,9 @@ FlashCtrl* flashCtrl_init(io_ctrl_func turn_on, io_ctrl_func turn_off, io_is_on_
  *             所以 cycles=2 时看到“亮、灭、亮、灭”，再按 endState 收尾；
  *             on_ms=0 或 off_ms=0 时凑不齐闪烁，cycles 实际不起作用（常亮/常灭请直接传 0）；
  *   起步与收尾都要把“灭段”与前后状态连起来，避免两个亮段首尾相接：
- *             起步时若当前是静止态（灭）→ 立刻进入动作态开始闪（不再等一个灭段）；
+ *             起步时若已经灭满一个 off_ms（含上电就灭着）→ 立刻进入动作态开始闪；
  *             起步时若当前是动作态（亮）→ 先切灭，补满一个完整 off_ms 的灭段，再开始闪；
+ *             起步时若灭着但还没灭满（刚 turnOff 就 setThdMs）→ 已灭的拍数算进来，补满剩余再亮；
  *   endState: 闪满 cycles 次后的终态，取值同 flashCtrlState_t：
  *             FLASH_CTRL_STS_ON 先补满一个完整 off_ms 的灭段，再点亮并停住（亮/鸣）、
  *             FLASH_CTRL_STS_OFF 亮段一结束就停住（灭/静）、
