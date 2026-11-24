@@ -816,8 +816,12 @@ static void doStart(FlashCtrl* handle) {
 #if FLASH_CTRL_LANG_EN
     /* 灯语不读 is_on、只靠相位推进，所以重新挂链时必须自己把端口驱动到相位该有的状态；
      * 并且从头报一遍 —— 停过一次之后接着报"半截错误码"没有意义，
-     * 否则恢复后可能剩半段不亮（该亮的段因为"相位没变、缓存也没变"而没人写端口）。 */
-    if(FLASH_CTRL_MODE_LANG == handle->mode && LANG_PH_OFF != handle->u.lang.phase){
+     * 否则恢复后可能剩半段不亮（该亮的段因为"相位没变、缓存也没变"而没人写端口）。
+     * 例外：相位是"本拍刚由 startLang 落库并驱动"的（phaseFresh），此时它本身就是第一段，
+     * 再从头报一遍会把刚进去的起始熄灭（leadOff）直接吞掉 —— 同一个 tick 里
+     * "start + startLang" 正是这种顺序，所以这里让位给刚设好的相位。 */
+    if(FLASH_CTRL_MODE_LANG == handle->mode && LANG_PH_OFF != handle->u.lang.phase
+       && 0 == handle->phaseFresh){
         handle->u.lang.phaseCnt   = 0;
         handle->u.lang.longDone   = 0;
         handle->u.lang.shortDone  = 0;
@@ -942,22 +946,22 @@ void flashCtrl_ticks(void) {
  * 下一拍重来；已经落库的数据全部来自本地副本，不会再被调用方改写。
  * 本函数只在 ticks 上下文里跑，调用方（主循环）同时可以随便写影子。 */
 static void serviceCfg(FlashCtrl* handle) {
-    uint8_t  code;
+    uint8_t  cmd;                        /* 名字不能叫 code：C51/C251 里 code 是存储类型关键字 */
     uint16_t a, b, c;
     uint8_t  d;
 
     if(0 == handle->inUse) return;
 
-    code = handle->cfgReq;
-    if(FLASH_CFG_NONE == code || (FLASH_CFG_BUSY & code)) return;
+    cmd = handle->cfgReq;
+    if(FLASH_CFG_NONE == cmd || (FLASH_CFG_BUSY & cmd)) return;
 
-    switch(code){
+    switch(cmd){
     case FLASH_CFG_SET_SIMPLE:
         a = handle->cfg.simple.on_ms;
         b = handle->cfg.simple.off_ms;
         c = handle->cfg.simple.cycles;
         d = handle->cfg.simple.endState;
-        if(code != handle->cfgReq) return;
+        if(cmd != handle->cfgReq) return;
         handle->cfgReq = FLASH_CFG_NONE;
         applySimple(handle, a, b, c, d);
         break;
@@ -967,7 +971,7 @@ static void serviceCfg(FlashCtrl* handle) {
         a = (uint16_t)handle->cfg.lang.longTotal;
         b = (uint16_t)handle->cfg.lang.shortTotal;
         c = (uint16_t)handle->cfg.lang.cycles;
-        if(code != handle->cfgReq) return;
+        if(cmd != handle->cfgReq) return;
         handle->cfgReq = FLASH_CFG_NONE;
         applyLangStart(handle, (uint8_t)a, (uint8_t)b, (uint8_t)c);
         break;
