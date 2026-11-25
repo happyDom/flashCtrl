@@ -77,7 +77,7 @@ example/
 | 方法 | 说明 |
 | --- | --- |
 | `flashCtrl_init(turn_on, turn_off, is_on)` | 在静态内存池中分配句柄并登记动作函数（`turn_on` 对应原 `clear_P42`，`turn_off` 对应原 `set_P42`）与状态读取函数（对应原 `getP42Sts`，需改成 1=亮 的语义）；返回句柄，池满返回 0。句柄分配后常驻，库内没有释放接口 |
-| `flashCtrl_setThdMs(handle, on_ms, off_ms, cycles, endState)` | 提交参数请求（下一拍生效），按毫秒数设置动作态 / 静止态时长，库内用 `FLASH_CTRL_CYCLE_MS` 换算成节拍数（向上取整，0 毫秒仍为 0 拍）；`cycles` 为需要的闪烁次数（0 = 一直闪下去），`endState` 为闪满后的终态（`KEEP` / `ON` / `OFF`） |
+| `flashCtrl_setThdMs(handle, on_ms, off_ms, cycles, endState)` | 提交参数请求（下一拍生效），按毫秒数设置动作态 / 静止态时长，库内用 `FLASH_CTRL_CYCLE_MS` 换算成节拍数（向上取整，0 毫秒仍为 0 拍）；`cycles` 为需要的闪烁次数（0 = 一直闪下去），`endState` 为闪满后的终态（`KEEP` / `ON` / `OFF`）。句柄正在闪烁中（两段时长都非 0、未闪满）时只换时长、保留当前相位与进度，不会重启 |
 | `flashCtrl_isFlashDone(handle)` | 简单模式是否已闪满 `cycles` 次（闪满后停在 `endState` 指定的终态、不再推进）；`cycles=0` 或非简单模式恒返回 0 |
 | `flashCtrl_getFlashCnt(handle)` | 查询简单模式已完成的闪烁次数 |
 | `flashCtrl_reset(handle)` | 下一拍清零当前阶段进度：简单模式清节拍计数与次数进度（含“已闪满”标志，可让同一套参数再跑一遍），灯语模式清阶段计时；不改变阈值、模式与执行器状态 |
@@ -217,6 +217,7 @@ flashCtrl_setLangCfgMs(500, 150, 300, 1200);   /* 长亮亮 500ms、短亮亮 15
   - 收尾 `ON` → 最后一次亮结束后，先补满一个完整 `off_ms` 的灭段，再点亮并停住；
   - 收尾 `OFF` / `KEEP` → 亮段一结束就停在灭（此刻本来就是灭的，无需再等）。
 - “已经灭了多久”由库内 `offRun` 记录（连续处于灭态的节拍数，亮着就清零），是历史量：跨 `setThdMs`、跨灯语/简单模式切换都保留，闪满停在灭态期间也会继续累计；上电初值按“灭了很久”处理，所以开机第一次 `setThdMs` 是立即亮。
+- **运行中调参不会重启**：句柄本来就在亮灭交替地闪着（旧的两段时长都非 0）、还没闪满时再调 `setThdMs`，只换时长，当前亮段/灭段的已计拍数与已闪次数全部保留 —— “每 2 秒把时长微调一点”的渐快/渐慢用法是平滑的。若每次都把进度清零，灯会在正亮着时被强行熄灭、再白等一个灭段，看起来就是毫无规律的乱闪。从常亮/常灭（有一段时长为 0）、灯语模式或闪满之后调用，才按上面的“起步”逻辑重新开始。
 - `on_thd = 0` 或 `off_thd = 0` 时凑不齐闪烁，`cycles` 实际不起作用（常亮 / 常灭请直接传 0）；
 - `cycles = 0`：一直闪下去，`flashCtrl_isFlashDone` 恒为 0，`flashCtrl_getFlashCnt` 是累计值（65535 封顶）；
 - `cycles > 0`：闪满即置位 `done`，句柄留在节拍链表但不再推进；终态由 `endState` 决定（见上）。注意这里的 `KEEP` 与 `flashCtrl_stop` 的口径不同：闪满时若不是要停在 `ON`，正常节拍本来就停在熄灭，`KEEP` 只是“不额外干预”，结果与 `OFF` 相同；想让灯亮着收尾请传 `ON`。闪满后可用 `flashCtrl_reset` 让同一套参数再跑一遍，或重新 `setThdMs`。

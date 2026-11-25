@@ -218,18 +218,36 @@ void flashCtrl_setThdMs(FlashCtrl* handle, uint16_t on_ms, uint16_t off_ms,
 /* 参数落库：只在 ticks 里执行 */
 static void applySimple(FlashCtrl* handle, uint16_t on_ms, uint16_t off_ms,
                         uint16_t cycles, uint8_t endState) {
-    handle->on_thd  = FLASH_CTRL_CNT_OF_MS(on_ms);
-    handle->off_thd = FLASH_CTRL_CNT_OF_MS(off_ms);
-    handle->cycles  = cycles;
+    uint16_t newOn  = FLASH_CTRL_CNT_OF_MS(on_ms);
+    uint16_t newOff = FLASH_CTRL_CNT_OF_MS(off_ms);
+    uint8_t  keep;
+
+    /* 判断这是"原地改节奏"还是"开始一段新节奏"：
+     *   新旧两套时长都非 0（即两边都是真正的亮灭交替）、当前就在简单模式里跑、
+     *   且没有闪满 —— 这种情况只该换阈值，当前的亮段/灭段应当接着走完。
+     * 应用层常见的用法是每 2 秒把时长微调一点（进度灯由慢闪逐渐变快），
+     * 若每次都把进度清零重跑，灯就会在"正亮着"时被强制熄灭、再白等一个灭段，
+     * 看起来就是毫无规律的乱闪。
+     * 反之，常亮/常灭（有一个时长为 0）、灯语切回简单模式、闪满后重设，
+     * 都按"新节奏"处理：进度清零，起步是否要补满一个灭段交给 toggle 按 offRun 判断。 */
+    keep = (uint8_t)((FLASH_CTRL_MODE_SIMPLE == handle->mode) && (0 == handle->u.simple.done)
+                     && (0 != handle->on_thd) && (0 != handle->off_thd)
+                     && (0 != newOn) && (0 != newOff));
+
+    handle->on_thd   = newOn;
+    handle->off_thd  = newOff;
+    handle->cycles   = cycles;
     handle->endState = endState;
 
-    handle->u.simple.on_cnt   = 0;
-    handle->u.simple.off_cnt  = 0;
-    handle->u.simple.cycleCnt = 0;
-    handle->u.simple.flashed  = 0;
-    handle->u.simple.gap      = 0;
-    handle->u.simple.finishOn = 0;
-    handle->u.simple.done     = 0;
+    if(!keep){
+        handle->u.simple.on_cnt   = 0;
+        handle->u.simple.off_cnt  = 0;
+        handle->u.simple.cycleCnt = 0;
+        handle->u.simple.flashed  = 0;
+        handle->u.simple.gap      = 0;
+        handle->u.simple.finishOn = 0;
+        handle->u.simple.done     = 0;
+    }
 
     /* 模式最后写：先让进度数据落到"简单模式"的样子，再按简单模式解释 */
     handle->mode = FLASH_CTRL_MODE_SIMPLE;
